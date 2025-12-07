@@ -1,4 +1,4 @@
-local IntegrationService = loadstring(request({Url = "https://raw.githubusercontent.com/YellowFireFighter/Open-Cheating-Network/refs/heads/main/Client/Main.lua", Method = "Get"}).Body)()
+local IntegrationService = loadstring(request({Url = "https://raw.githubusercontent.com/ltseverydayyou/Open-Cheating-Network/refs/heads/main/Client/Main.lua", Method = "Get"}).Body)()
 
 IntegrationService.OnChatMessage.Event:Connect(function(username, message, timestamp)
     print(string.format("[%s]: %s", username, message))

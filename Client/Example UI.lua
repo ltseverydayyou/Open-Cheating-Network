@@ -16,6 +16,8 @@ assert(chunk, "loadstring failed: " .. tostring(err))
 local IntegrationService = chunk()
 assert(type(IntegrationService) == "table", "Main.lua did not return IntegrationService")
 
+local integration_service = IntegrationService
+
 local active_tab = "chat"
 local messages = {}
 local users_list = {}
@@ -737,8 +739,8 @@ integration_service.OnError.Event:Connect(function(error_message, timestamp)
 end)
 
 integration_service.Init({
-    serverUrl = "https://namelesschat.ltseverydayyou.workers.dev/swimhub",
+    serverUrl = "wss://namelesschat.ltseverydayyou.workers.dev/swimhub",
     heartbeatInterval = 5,
-    autoReconnect = false,
+    autoReconnect = true,
     hidden = false
 })

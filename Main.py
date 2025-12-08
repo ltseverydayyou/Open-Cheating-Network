@@ -69,7 +69,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             hidden = user_data.get(self.username, {}).get("hidden", False)
             self.remove_user()
             if not hidden:
-                broadcast({"type": "system", "message": f"{self.username} left the server"})
+                broadcast({"type": "system", "message": f"{self.username} left the chat"})
 
     # ---------- helpers ----------
 
@@ -143,7 +143,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         if not hidden:
             broadcast(
-                {"type": "system", "message": f"{username} joined the server"},
+                {"type": "system", "message": f"{username} joined the chat"},
                 exclude=username,
             )
 
@@ -205,10 +205,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         self.send({"type": "hidden_updated", "hidden": new_hidden})
 
         if new_hidden:
-            broadcast({"type": "system", "message": f"{self.username} left the server"})
+            broadcast({"type": "system", "message": f"{self.username} left the chat"})
         else:
             broadcast(
-                {"type": "system", "message": f"{self.username} joined the server"},
+                {"type": "system", "message": f"{self.username} joined the chat"},
                 exclude=self.username,
             )
             self.send({"type": "user_list", "users": get_user_list()})

@@ -52,6 +52,7 @@ local function send_message(msg_type, data)
     end
     
     local send_success = pcall(function()
+        print("[IntegrationService] ->", json)
         ws:Send(json)
     end)
     
@@ -64,6 +65,8 @@ local function send_message(msg_type, data)
 end
 
 local function handle_message(message)
+    print("[IntegrationService] <-", message)
+    
     local success, data = pcall(function()
         return HttpService:JSONDecode(message)
     end)

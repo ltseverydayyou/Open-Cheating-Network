@@ -219,7 +219,16 @@ def make_app():
 
 if __name__ == "__main__":
     app = make_app()
-    port = int(os.environ.get("PORT", "8888"))
+
+    port = int(os.environ.get("PORT", "8000")) 
     app.listen(port)
-    print("Server started on port", port)
+    
+    tornado.ioloop.PeriodicCallback(cleanup_inactive_users, 10000).start()
+    
+    print("="*50)
+    print(f"Server started on port {port} ..")
+    if CONFIG["bridge_servers"]:
+        print(f"Bridging to {len(CONFIG['bridge_servers'])} servers")
+    print("="*50)
+    
     tornado.ioloop.IOLoop.current().start()

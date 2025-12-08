@@ -554,7 +554,6 @@ end
 local function send_message()
     local text = input_box.Text
     if text ~= "" and is_connected and not is_hidden then
-        print("[OCN UI] Sending:", text)
         integration_service.SendMessage(text)
         input_box.Text = ""
         
@@ -698,7 +697,6 @@ input_box.FocusLost:Connect(function(enter_pressed)
 end)
 
 integration_service.OnChatMessage.Event:Connect(function(username, message, timestamp)
-    print("[OCN UI] OnChatMessage", username, message, timestamp)
     if not is_hidden then
         add_message(username, message)
     end

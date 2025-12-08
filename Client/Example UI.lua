@@ -698,6 +698,7 @@ input_box.FocusLost:Connect(function(enter_pressed)
 end)
 
 integration_service.OnChatMessage.Event:Connect(function(username, message, timestamp)
+    print("[OCN UI] OnChatMessage", username, message, timestamp)
     if not is_hidden then
         add_message(username, message)
     end

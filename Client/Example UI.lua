@@ -722,7 +722,7 @@ integration_service.OnError.Event:Connect(function(error_message, timestamp)
 end)
 
 integration_service.Init({
-    serverUrl = "ws://localhost:8888/swimhub",
+    serverUrl = "https://namelesschat.ltseverydayyou.workers.dev/swimhub",
     heartbeatInterval = 5,
     autoReconnect = false,
     hidden = false

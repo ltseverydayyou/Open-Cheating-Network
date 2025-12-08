@@ -1,5 +1,20 @@
 -- Shit ui made with gui to lua but u can use if u want ig (vibe coded)
-local IntegrationService = loadstring(request({Url = "https://raw.githubusercontent.com/ltseverydayyou/Open-Cheating-Network/refs/heads/main/Client/Main.lua", Method = "Get"}).Body)()
+local req = request or http_request or (syn and syn.request)
+assert(req, "No request function available")
+
+local res = req({
+    Url = "https://raw.githubusercontent.com/ltseverydayyou/Open-Cheating-Network/refs/heads/main/Client/Main.lua",
+    Method = "GET"
+})
+
+local body = res.Body or res.body
+assert(type(body) == "string" and #body > 0, "Empty response from Main.lua")
+
+local chunk, err = loadstring(body)
+assert(chunk, "loadstring failed: " .. tostring(err))
+
+local IntegrationService = chunk()
+assert(type(IntegrationService) == "table", "Main.lua did not return IntegrationService")
 
 local active_tab = "chat"
 local messages = {}

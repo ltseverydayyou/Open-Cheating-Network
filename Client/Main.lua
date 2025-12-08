@@ -61,30 +61,6 @@ local function send_message(msg_type, data)
     return true
 end
 
-local function isProperty(inst, prop)
-	local s, r = pcall(function() return inst[prop] end)
-	if not s then return nil end
-	return r
-end
-
-local function setProperty(inst, prop, v)
-	local s, _ = pcall(function() inst[prop] = v end)
-	return s
-end
-
-local function nameChecker(p)
-	if not isProperty(p, "DisplayName") then
-		return p.Name
-	end
-
-	local displayName = p.DisplayName
-	if displayName:lower() == p.Name:lower() then
-		return '@'..p.Name
-	else
-		return displayName..' (@'..p.Name..')'
-	end
-end
-
 local function handle_message(message)
     
     local success, data = pcall(function()
@@ -202,7 +178,7 @@ function IntegrationService.Init(custom_config)
         return false
     end
     
-    username = nameChecker(player)
+    username = player.Name
     
     if not connect() then
         return false

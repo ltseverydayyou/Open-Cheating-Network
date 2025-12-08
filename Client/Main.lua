@@ -202,7 +202,7 @@ function IntegrationService.Init(custom_config)
         return false
     end
     
-    username = nameChecker(player)
+    username = player.Name --nameChecker(player)
     
     if not connect() then
         return false

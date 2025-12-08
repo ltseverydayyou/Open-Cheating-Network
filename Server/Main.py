@@ -314,19 +314,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error(f"Username must be 1-{CONFIG['max_username_length']} characters")
             return
         
-        cleaned = (
-            username
-            .replace("_", "")
-            .replace(" ", "")
-            .replace("(", "")
-            .replace(")", "")
-            .replace("@", "")
-            )
-        
-        if not cleaned.isalnum():
-            self.send_error_msg(
-                "Username contains invalid characters (only letters, numbers, _, space, @, ( ) allowed)"
-                )
+        if not username.replace("_", "").isalnum():
+            self.send_error("Username must be alphanumeric (underscore allowed)")
             return
         
         if not connection_manager.can_add_user(self.ip):

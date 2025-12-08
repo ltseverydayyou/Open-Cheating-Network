@@ -741,7 +741,7 @@ integration_service.OnError.Event:Connect(function(error_message, timestamp)
 end)
 
 integration_service.Init({
-    serverUrl = "wss://namelesschat.ltseverydayyou.workers.dev/swimhub",
+    serverUrl = "wss://witty-minette-adonis-632b17c0.koyeb.app/swimhub",
     heartbeatInterval = 5,
     autoReconnect = true,
     hidden = false

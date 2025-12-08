@@ -177,7 +177,7 @@ function IntegrationService.Init(custom_config)
         end
     end
     
-    local player = game.Players.LocalPlayer
+    local player = game:GetService("Players").LocalPlayer
     if not player then
         return false
     end
@@ -200,7 +200,7 @@ function IntegrationService.Init(custom_config)
         start_heartbeat()
     end
     
-    game.Players.LocalPlayer.AncestryChanged:Connect(function(_, parent)
+    game:GetService("Players").LocalPlayer.AncestryChanged:Connect(function(_, parent)
         if not parent then
             IntegrationService.Disconnect()
         end

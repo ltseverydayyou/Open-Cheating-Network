@@ -217,18 +217,42 @@ def make_app():
     )
 
 
+def cleanup_inactive_users():
+    timeout = CONFIG["heartbeat_timeout"]
+    now = time.time()
+    to_remove = []
+
+    for name, data in list(user_data.items()):
+        last_seen = data.get("last_seen", now)
+        if now - last_seen > timeout:
+            to_remove.append(name)
+
+    for name in to_remove:
+        print("Removing inactive user", name)
+        ws = connections.pop(name, None)
+        user_data.pop(name, None)
+
+        if ws:
+            try:
+                ws.close(1000, "Inactive timeout")
+            except Exception:
+                pass
+
+        broadcast({
+            "type": "system",
+            "message": f"{name} left (timeout)"
+        })
+
 if __name__ == "__main__":
     app = make_app()
 
-    port = int(os.environ.get("PORT", "8000")) 
+    port = int(os.environ.get("PORT", "8000"))
     app.listen(port)
-    
+
     tornado.ioloop.PeriodicCallback(cleanup_inactive_users, 10000).start()
-    
-    print("="*50)
+
+    print("=" * 50)
     print(f"Server started on port {port} ..")
-    if CONFIG["bridge_servers"]:
-        print(f"Bridging to {len(CONFIG['bridge_servers'])} servers")
-    print("="*50)
-    
+    print("=" * 50)
+
     tornado.ioloop.IOLoop.current().start()

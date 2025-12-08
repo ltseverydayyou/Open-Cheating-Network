@@ -68,8 +68,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             print(self.username, "disconnected")
             hidden = user_data.get(self.username, {}).get("hidden", False)
             self.remove_user()
-            if not hidden:
-                broadcast({"type": "system", "message": f"{self.username} left the chat"})
+            # if not hidden:
+            #     broadcast({"type": "system", "message": f"{self.username} left the chat"})
 
     # ---------- helpers ----------
 
@@ -116,12 +116,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             .replace("(", "")
             .replace(")", "")
             .replace("@", "")
-            )
-        
+        )
+
         if not cleaned.isalnum():
             self.send_error_msg(
                 "Username contains invalid characters (only letters, numbers, _, space, @, ( ) allowed)"
-                )
+            )
             return
 
         if username in connections and connections[username] is not self:
@@ -141,11 +141,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "hidden": hidden,
         })
 
-        if not hidden:
-            broadcast(
-                {"type": "system", "message": f"{username} joined the chat"},
-                exclude=username,
-            )
+        # if not hidden:
+        #     broadcast(
+        #         {"type": "system", "message": f"{username} joined the chat"},
+        #         exclude=username,
+        #     )
 
         self.send({"type": "user_list", "users": get_user_list()})
 
@@ -204,14 +204,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         user_data[self.username]["hidden"] = new_hidden
         self.send({"type": "hidden_updated", "hidden": new_hidden})
 
-        if new_hidden:
-            broadcast({"type": "system", "message": f"{self.username} left the chat"})
-        else:
-            broadcast(
-                {"type": "system", "message": f"{self.username} joined the chat"},
-                exclude=self.username,
-            )
-            self.send({"type": "user_list", "users": get_user_list()})
+        # if new_hidden:
+        #     broadcast({"type": "system", "message": f"{self.username} left the chat"})
+        # else:
+        #     broadcast(
+        #         {"type": "system", "message": f"{self.username} joined the chat"},
+        #         exclude=self.username,
+        #     )
+        #     self.send({"type": "user_list", "users": get_user_list()})
 
 
 class HealthHandler(tornado.web.RequestHandler):
@@ -249,10 +249,11 @@ def cleanup_inactive_users():
             except Exception:
                 pass
 
-        broadcast({
-            "type": "system",
-            "message": f"{name} left (timeout)"
-        })
+        # broadcast({
+        #     "type": "system",
+        #     "message": f"{name} left (timeout)"
+        # })
+
 
 if __name__ == "__main__":
     app = make_app()

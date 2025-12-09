@@ -216,7 +216,7 @@ function IntegrationService.Init(custom_config)
         return false
     end
     
-    username = nameChecker(player)
+    username = player.Name --nameChecker(player)
     local userId = player.UserId
 
     local isNAadmin = false

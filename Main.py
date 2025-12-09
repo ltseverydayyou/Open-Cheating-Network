@@ -8,7 +8,8 @@ import tornado.websocket
 CONFIG = {
     "max_username_length": 20,
     "max_message_length": 500,
-    "heartbeat_timeout": 30,
+    "heartbeat_timeout": 90,
+    "max_game_name_length": 80,
 }
 
 connections = {}      # username -> WebSocketHandler
@@ -17,7 +18,19 @@ ip_users = {}         # ip -> set(usernames)
 
 
 def get_user_list():
-    return [u for u, d in user_data.items() if not d.get("hidden", False)]
+    result = []
+    for u, d in user_data.items():
+        if d.get("hidden", False):
+            continue
+        result.append({
+            "username": u,
+            "userId": d.get("user_id"),
+            "admin": bool(d.get("admin", False)),
+            "game": d.get("game_status") or "",
+            "placeId": d.get("place_id"),
+            "jobId": d.get("job_id"),
+        })
+    return result
 
 
 def broadcast(obj, exclude=None):
@@ -83,11 +96,16 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def send_error_msg(self, msg):
         self.send({"type": "error", "message": msg})
 
-    def add_user(self, username, hidden):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None):
         connections[username] = self
         user_data[username] = {
             "hidden": hidden,
             "last_seen": time.time(),
+            "user_id": user_id,
+            "admin": bool(is_admin),
+            "game_status": game_status or "",
+            "place_id": place_id,
+            "job_id": job_id,
         }
 
     def remove_user(self):
@@ -102,6 +120,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def handle_register(self, data):
         username = (data.get("username") or "").strip()
         hidden = bool(data.get("hidden", False))
+        user_id = data.get("userId")
+        is_admin = bool(data.get("admin", False))
+        raw_game = (data.get("game") or "").strip()
+        place_id = data.get("placeId")
+        job_id = data.get("jobId")
+        if len(raw_game) > CONFIG["max_game_name_length"]:
+            raw_game = raw_game[: CONFIG["max_game_name_length"]]
 
         if not username or len(username) > CONFIG["max_username_length"]:
             self.send_error_msg(
@@ -132,13 +157,18 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 pass
 
         self.username = username
-        self.add_user(username, hidden)
+        self.add_user(username, hidden, user_id=user_id, is_admin=is_admin, game_status=raw_game, place_id=place_id, job_id=job_id)
 
         self.send({
             "type": "registered",
             "username": username,
             "token": "dummy_token",
             "hidden": hidden,
+            "userId": user_id,
+            "admin": is_admin,
+            "game": raw_game,
+            "placeId": place_id,
+            "jobId": job_id,
         })
 
         # if not hidden:
@@ -167,10 +197,18 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         print("chat from", self.username, ":", msg)
 
+        info = user_data.get(self.username, {})
+        user_id = info.get("user_id")
+        is_admin = bool(info.get("admin", False))
+        game_status = info.get("game_status") or ""
+
         broadcast({
             "type": "chat",
             "username": self.username,
             "message": msg,
+            "userId": user_id,
+            "admin": is_admin,
+            "game": game_status,
         })
 
     def handle_heartbeat(self):

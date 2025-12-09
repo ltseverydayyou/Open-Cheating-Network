@@ -1,4 +1,5 @@
 local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
 
 local IntegrationService = {}
 IntegrationService.__index = IntegrationService
@@ -25,9 +26,22 @@ local config = {
     hidden = false
 }
 
+local function getGameStatus()
+    local ok, result = pcall(function()
+        local placeId = game.PlaceId
+        local info = game:GetService("MarketplaceService"):GetProductInfo(placeId)
+        local name = typeof(info) == "table" and info.Name or nil
+        return name or ("PlaceId: " .. tostring(placeId))
+    end)
+    if ok and type(result) == "string" then
+        return result
+    end
+    return "Unknown place"
+end
+
 local function send_message(msg_type, data)
     if not ws then 
-        warn("[IntegrationService] Cannot send message: not connected")
+        --warn("[IntegrationService] Cannot send message: not connected")
         return false
     end
     
@@ -92,7 +106,7 @@ local function handle_message(message)
     end)
     
     if not success then
-        warn("[IntegrationService] Failed to decode message:", message)
+        --warn("[IntegrationService] Failed to decode message:", message)
         return
     end
     
@@ -104,10 +118,10 @@ local function handle_message(message)
         token = data.token
         is_hidden = data.hidden or false
         
-        IntegrationService.OnConnected:Fire(username, token, is_hidden)
+        IntegrationService.OnConnected:Fire(username, token, is_hidden, data.userId, data.admin, data.game)
         
     elseif msg_type == "chat" then
-        IntegrationService.OnChatMessage:Fire(data.username, data.message, data.timestamp)
+        IntegrationService.OnChatMessage:Fire(data.username, data.message, data.timestamp, data.userId, data.admin, data.game)
         
     elseif msg_type == "system" then
         IntegrationService.OnSystemMessage:Fire(data.message, data.timestamp)
@@ -125,7 +139,7 @@ local function handle_message(message)
         )
         
     elseif msg_type == "error" then
-        warn("[IntegrationService] Server error:", data.message)
+        --warn("[IntegrationService] Server error:", data.message)
         IntegrationService.OnError:Fire(data.message, data.timestamp)
     end
 end
@@ -154,7 +168,7 @@ end
 
 local function connect()
     if ws then
-        warn("[IntegrationService] Already connected")
+        --warn("[IntegrationService] Already connected")
         return false
     end
     
@@ -163,7 +177,7 @@ local function connect()
     end)
     
     if not success then
-        warn("[IntegrationService] Failed to connect:", connection)
+        --warn("[IntegrationService] Failed to connect:", connection)
         return false
     end
     
@@ -197,12 +211,37 @@ function IntegrationService.Init(custom_config)
         end
     end
     
-    local player = game:GetService("Players").LocalPlayer
+    local player = Players.LocalPlayer
     if not player then
         return false
     end
     
     username = player.Name --nameChecker(player)
+    local userId = player.UserId
+
+    local isNAadmin = false
+    local adminsList = rawget(_G, "NAadminsLol")
+    if type(adminsList) == "table" and type(userId) == "number" then
+        for _, id in ipairs(adminsList) do
+            if id == userId then
+                isNAadmin = true
+                break
+            end
+        end
+    end
+
+    local gameStatus = nil
+    local placeIdForShare = nil
+    local jobIdForShare = nil
+    local okGameFlag, flag = pcall(function()
+        local na = rawget(_G, "NAmanage")
+        return na and na.NAChatGameActivityEnabled and na.NAChatGameActivityEnabled()
+    end)
+    if not (okGameFlag and flag == false) then
+        gameStatus = getGameStatus()
+        placeIdForShare = game.PlaceId
+        jobIdForShare = tostring(game.JobId)
+    end
     
     if not connect() then
         return false
@@ -210,8 +249,16 @@ function IntegrationService.Init(custom_config)
     
     task.wait(0.5)
     
-    if not send_message("register", {username = username, hidden = config.hidden}) then
-        warn("[IntegrationService] Failed to send registration")
+    if not send_message("register", {
+        username = username,
+        userId = userId,
+        admin = isNAadmin,
+        game = gameStatus,
+        placeId = placeIdForShare,
+        jobId = jobIdForShare,
+        hidden = config.hidden
+    }) then
+        --warn("[IntegrationService] Failed to send registration")
         return false
     end
     
@@ -231,12 +278,12 @@ end
 
 function IntegrationService.SendMessage(message)
     if not registered then
-        warn("[IntegrationService] Cannot send message: not registered")
+        --warn("[IntegrationService] Cannot send message: not registered")
         return false
     end
     
     if is_hidden then
-        warn("[IntegrationService] Cannot send message: hidden mode active")
+        --warn("[IntegrationService] Cannot send message: hidden mode active")
         return false
     end
     
@@ -247,7 +294,7 @@ function IntegrationService.SendMessage(message)
     message = message:gsub("^%s+", ""):gsub("%s+$", "")
     
     if message == "" then
-        warn("[IntegrationService] Cannot send empty message")
+        --warn("[IntegrationService] Cannot send empty message")
         return false
     end
     
@@ -256,12 +303,12 @@ end
 
 function IntegrationService.GetUsers()
     if not registered then
-        warn("[IntegrationService] Cannot get users: not registered")
+        --warn("[IntegrationService] Cannot get users: not registered")
         return false
     end
     
     if is_hidden then
-        warn("[IntegrationService] Cannot get users: hidden mode active")
+        --warn("[IntegrationService] Cannot get users: hidden mode active")
         return false
     end
     
@@ -278,12 +325,12 @@ end
 
 function IntegrationService.SetHidden(hidden)
     if not registered then
-        warn("[IntegrationService] Cannot change hidden status: not registered")
+        --warn("[IntegrationService] Cannot change hidden status: not registered")
         return false
     end
     
     if type(hidden) ~= "boolean" then
-        warn("[IntegrationService] Hidden must be a boolean value")
+        --warn("[IntegrationService] Hidden must be a boolean value")
         return false
     end
     

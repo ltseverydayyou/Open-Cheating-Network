@@ -6,7 +6,7 @@ import tornado.web
 import tornado.websocket
 
 CONFIG = {
-    "max_username_length": 20,
+    "max_username_length": 50,
     "max_message_length": 500,
     "heartbeat_timeout": 90,
     "max_game_name_length": 80,

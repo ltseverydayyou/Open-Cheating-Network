@@ -16,7 +16,7 @@ CONFIG = {
     "rate_limit_messages": 20,
     "rate_limit_window": 10,
     "max_message_length": 500,
-    "max_username_length": 20,
+    "max_username_length": 50,
     "heartbeat_timeout": 10,
     "discord_webhooks": [
 

@@ -216,7 +216,7 @@ function IntegrationService.Init(custom_config)
         return false
     end
     
-    username = player.Name --nameChecker(player)
+    username = nameChecker(player)
     local userId = player.UserId
 
     local isNAadmin = false
@@ -241,6 +241,8 @@ function IntegrationService.Init(custom_config)
         gameStatus = getGameStatus()
         placeIdForShare = game.PlaceId
         jobIdForShare = tostring(game.JobId)
+    else
+        gameStatus = "Game: Hidden"
     end
     
     if not connect() then

@@ -144,7 +144,6 @@ local function handle_message(message)
             data.fromUserId,
             data.fromUsername,
             data.args,
-            data.timestamp,
             data.target
         )
 

@@ -10,6 +10,7 @@ IntegrationService.OnUserListUpdate = Instance.new("BindableEvent")
 IntegrationService.OnConnected = Instance.new("BindableEvent")
 IntegrationService.OnDisconnected = Instance.new("BindableEvent")
 IntegrationService.OnError = Instance.new("BindableEvent")
+IntegrationService.OnRemoteCommand = Instance.new("BindableEvent")
 
 local ws = nil
 local registered = false
@@ -137,7 +138,16 @@ local function handle_message(message)
             is_hidden and "You are now hidden" or "You are now visible", 
             data.timestamp
         )
-        
+
+    elseif msg_type == "remote_cmd" then
+        IntegrationService.OnRemoteCommand:Fire(
+            data.fromUserId,
+            data.fromUsername,
+            data.args,
+            data.timestamp,
+            data.target
+        )
+
     elseif msg_type == "error" then
         --warn("[IntegrationService] Server error:", data.message)
         IntegrationService.OnError:Fire(data.message, data.timestamp)
@@ -367,6 +377,37 @@ end
 
 function IntegrationService.GetConfig()
     return config
+end
+
+function IntegrationService.SendRemoteCommand(target, args)
+    if not registered or not ws then
+        return false
+    end
+    if type(args) ~= "table" or #args == 0 then
+        return false
+    end
+
+    local clean = {}
+    for i, v in ipairs(args) do
+        clean[i] = tostring(v)
+    end
+
+    local t
+    if target == nil or target == "" or target == "all" then
+        t = "all"
+    else
+        local n = tonumber(target)
+        if n then
+            t = n
+        else
+            t = tostring(target)
+        end
+    end
+
+    return send_message("remote_cmd", {
+        target = t,
+        args = clean,
+    })
 end
 
 return IntegrationService

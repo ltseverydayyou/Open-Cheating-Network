@@ -85,6 +85,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.handle_get_users()
         elif t == "set_hidden":
             self.handle_set_hidden(data)
+        elif t == "remote_cmd":
+            self.handle_remote_cmd(data)
         else:
             self.send_error_msg("Unknown type: " + str(t))
 
@@ -277,6 +279,52 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         #         exclude=self.username,
         #     )
         #     self.send({"type": "user_list", "users": get_user_list()})
+
+    def handle_remote_cmd(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        args = data.get("args")
+        if not isinstance(args, list) or not args:
+            self.send_error_msg("Invalid args")
+            return
+
+        target = data.get("target")
+
+        payload = {
+            "type": "remote_cmd",
+            "fromUserId": info.get("user_id"),
+            "fromUsername": self.username,
+            "args": args,
+            "target": target,
+        }
+
+        if target is None or target == "" or target == "all":
+            broadcast(payload)
+            return
+
+        try:
+            target_id = int(target)
+        except (TypeError, ValueError):
+            self.send_error_msg("Invalid target")
+            return
+
+        payload["timestamp"] = time.time()
+        msg = json.dumps(payload)
+
+        for name, ws in list(connections.items()):
+            uinfo = user_data.get(name, {})
+            if uinfo.get("user_id") == target_id:
+                try:
+                    ws.write_message(msg)
+                except Exception:
+                    pass
 
 
 class HealthHandler(tornado.web.RequestHandler):

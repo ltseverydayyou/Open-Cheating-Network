@@ -219,17 +219,6 @@ function IntegrationService.Init(custom_config)
     username = player.Name --nameChecker(player)
     local userId = player.UserId
 
-    local isNAadmin = false
-    local adminsList = rawget(_G, "NAadminsLol")
-    if type(adminsList) == "table" and type(userId) == "number" then
-        for _, id in ipairs(adminsList) do
-            if id == userId then
-                isNAadmin = true
-                break
-            end
-        end
-    end
-
     local gameStatus = nil
     local placeIdForShare = nil
     local jobIdForShare = nil
@@ -254,7 +243,6 @@ function IntegrationService.Init(custom_config)
     if not send_message("register", {
         username = username,
         userId = userId,
-        admin = isNAadmin,
         game = gameStatus,
         placeId = placeIdForShare,
         jobId = jobIdForShare,

@@ -12,6 +12,18 @@ CONFIG = {
     "max_game_name_length": 80,
 }
 
+ADMIN_IDS = {
+    11761417,    # Main
+    530829101,   # Viper
+    817571515,   # Aimlock
+    1844177730,  # glexinator
+    2624269701,  # Akim
+    2502806181,  # Main Alt
+    1594235217,  # Purple
+    2845101018,  # alt
+    2019160453,  # grim
+}
+
 connections = {}      # username -> WebSocketHandler
 user_data = {}        # username -> {hidden, last_seen}
 ip_users = {}         # ip -> set(usernames)
@@ -121,10 +133,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         username = (data.get("username") or "").strip()
         hidden = bool(data.get("hidden", False))
         user_id = data.get("userId")
-        is_admin = bool(data.get("admin", False))
         raw_game = (data.get("game") or "").strip()
         place_id = data.get("placeId")
         job_id = data.get("jobId")
+
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
 
@@ -150,14 +162,29 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
 
         if username in connections and connections[username] is not self:
-            # kick old connection
             try:
                 connections[username].close(1000, "Replaced")
             except Exception:
                 pass
 
+        # authoritative admin check, server-side only
+        is_admin = False
+        try:
+            if isinstance(user_id, int) and user_id in ADMIN_IDS:
+                is_admin = True
+        except Exception:
+            is_admin = False
+
         self.username = username
-        self.add_user(username, hidden, user_id=user_id, is_admin=is_admin, game_status=raw_game, place_id=place_id, job_id=job_id)
+        self.add_user(
+            username,
+            hidden,
+            user_id=user_id,
+            is_admin=is_admin,
+            game_status=raw_game,
+            place_id=place_id,
+            job_id=job_id,
+        )
 
         self.send({
             "type": "registered",

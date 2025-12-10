@@ -232,7 +232,7 @@ function IntegrationService.Init(custom_config)
     local placeIdForShare = nil
     local jobIdForShare = nil
     local okGameFlag, flag = pcall(function()
-        return NAChatGameActivityEnabled and NAChatGameActivityEnabled()
+        return _G.NAChatGameActivityEnabled and _G.NAChatGameActivityEnabled()
     end)
     if not (okGameFlag and flag == false) then
         gameStatus = getGameStatus()

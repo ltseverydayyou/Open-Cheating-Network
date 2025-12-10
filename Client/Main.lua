@@ -338,7 +338,19 @@ end
 function IntegrationService.Disconnect()
     if ws then
         stop_heartbeat()
-        ws:Close()
+
+        pcall(function()
+            if ws.Close then
+                ws:Close()
+            elseif ws.close then
+                ws:close()
+            elseif ws.Disconnect then
+                ws:Disconnect()
+            elseif ws.disconnect then
+                ws:disconnect()
+            end
+        end)
+
         ws = nil
         registered = false
         username = nil

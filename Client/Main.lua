@@ -14,10 +14,6 @@ IntegrationService.OnRemoteCommand = Instance.new("BindableEvent")
 
 IntegrationService.OnTyping = Instance.new("BindableEvent")
 IntegrationService.OnPrivateMessage = Instance.new("BindableEvent")
-IntegrationService.OnGroupMessage = Instance.new("BindableEvent")
-IntegrationService.OnGroupInvite = Instance.new("BindableEvent")
-IntegrationService.OnGroupCreated = Instance.new("BindableEvent")
-IntegrationService.OnGroupJoined = Instance.new("BindableEvent")
 
 local ws = nil
 local registered = false
@@ -167,40 +163,6 @@ local function handle_message(message)
             data.from,
             data.to,
             data.message,
-            data.timestamp
-        )
-
-    elseif msg_type == "group_chat" then
-        IntegrationService.OnGroupMessage:Fire(
-            data.group_id,
-            data.from,
-            data.message,
-            data.timestamp,
-            data.group_name
-        )
-
-    elseif msg_type == "group_invite" then
-        IntegrationService.OnGroupInvite:Fire(
-            data.group_id,
-            data.group_name,
-            data.from,
-            data.timestamp
-        )
-
-    elseif msg_type == "group_created" then
-        IntegrationService.OnGroupCreated:Fire(
-            data.group_id,
-            data.group_name,
-            data.owner,
-            data.members,
-            data.timestamp
-        )
-
-    elseif msg_type == "group_joined" then
-        IntegrationService.OnGroupJoined:Fire(
-            data.group_id,
-            data.group_name,
-            data.members,
             data.timestamp
         )
 
@@ -391,79 +353,6 @@ function IntegrationService.SendPrivateMessage(target, message)
 
     return send_message("private_chat", {
         target = target,
-        message = message,
-    })
-end
-
-function IntegrationService.CreateGroup(name)
-    if not registered or is_hidden then
-        return false
-    end
-    name = tostring(name or ""):sub(1, 32)
-    if name == "" then
-        name = (username or "Group")
-    end
-    return send_message("create_group", { name = name })
-end
-
-function IntegrationService.InviteToGroup(groupId, target)
-    if not registered or is_hidden then
-        return false
-    end
-    if type(groupId) ~= "string" or groupId == "" then
-        return false
-    end
-    if type(target) ~= "string" or target == "" then
-        return false
-    end
-    return send_message("group_invite", {
-        group_id = groupId,
-        target = target,
-    })
-end
-
-function IntegrationService.AcceptGroupInvite(groupId)
-    if not registered or is_hidden then
-        return false
-    end
-    if type(groupId) ~= "string" or groupId == "" then
-        return false
-    end
-    return send_message("group_accept", {
-        group_id = groupId,
-    })
-end
-
-function IntegrationService.LeaveGroup(groupId)
-    if not registered then
-        return false
-    end
-    if type(groupId) ~= "string" or groupId == "" then
-        return false
-    end
-    return send_message("group_leave", {
-        group_id = groupId,
-    })
-end
-
-function IntegrationService.SendGroupMessage(groupId, message)
-    if not registered or is_hidden then
-        return false
-    end
-    if type(groupId) ~= "string" or groupId == "" then
-        return false
-    end
-
-    if type(message) ~= "string" then
-        message = tostring(message)
-    end
-    message = message:gsub("^%s+", ""):gsub("%s+$", "")
-    if message == "" then
-        return false
-    end
-
-    return send_message("group_chat", {
-        group_id = groupId,
         message = message,
     })
 end

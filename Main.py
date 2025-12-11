@@ -10,7 +10,6 @@ CONFIG = {
     "max_message_length": 500,
     "heartbeat_timeout": 90,
     "max_game_name_length": 80,
-    "max_groups_per_user": 10,
 }
 
 ADMIN_IDS = {
@@ -28,15 +27,6 @@ ADMIN_IDS = {
 connections = {}      # username -> WebSocketHandler
 user_data = {}        # username -> {hidden, last_seen, ...}
 ip_users = {}         # ip -> set(usernames)
-groups = {}           # group_id -> {"name", "owner", "members", "invites"}
-next_group_id = 1
-
-
-def new_group_id():
-    global next_group_id
-    gid = f"grp-{next_group_id}"
-    next_group_id += 1
-    return gid
 
 
 def get_user_list():
@@ -115,16 +105,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.handle_typing(data)
         elif t == "private_chat":
             self.handle_private_chat(data)
-        elif t == "create_group":
-            self.handle_create_group(data)
-        elif t == "group_invite":
-            self.handle_group_invite(data)
-        elif t == "group_accept":
-            self.handle_group_accept(data)
-        elif t == "group_leave":
-            self.handle_group_leave(data)
-        elif t == "group_chat":
-            self.handle_group_chat(data)
         else:
             self.send_error_msg("Unknown type: " + str(t))
 
@@ -166,19 +146,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         connections.pop(u, None)
         user_data.pop(u, None)
-
-        to_delete = []
-        for gid, info in groups.items():
-            members = info.get("members") or set()
-            invites = info.get("invites") or set()
-            if u in members:
-                members.discard(u)
-            if u in invites:
-                invites.discard(u)
-            if not members:
-                to_delete.append(gid)
-        for gid in to_delete:
-            groups.pop(gid, None)
 
     # ---------- handlers ----------
 
@@ -386,174 +353,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         if not send_to_user(target, payload):
             self.send_error_msg(f"User '{target}' is not online")
-
-    def handle_create_group(self, data):
-        if not self.username:
-            self.send_error_msg("Not registered")
-            return
-        if user_data.get(self.username, {}).get("hidden"):
-            self.send_error_msg("Hidden users cannot create groups")
-            return
-
-        # Limit groups per user to avoid abuse
-        owned = [
-            gid for gid, info in groups.items()
-            if info.get("owner") == self.username
-        ]
-        if len(owned) >= CONFIG.get("max_groups_per_user", 10):
-            self.send_error_msg("Group limit reached")
-            return
-
-        name = (data.get("name") or "").strip() or f"{self.username}'s group"
-        name = name[:32]
-
-        gid = new_group_id()
-        groups[gid] = {
-            "name": name,
-            "owner": self.username,
-            "members": {self.username},
-            "invites": set(),
-        }
-
-        self.send(
-            {
-                "type": "group_created",
-                "group_id": gid,
-                "group_name": name,
-                "owner": self.username,
-                "members": [self.username],
-            }
-        )
-
-    def handle_group_invite(self, data):
-        if not self.username:
-            self.send_error_msg("Not registered")
-            return
-
-        group_id = (data.get("group_id") or "").strip()
-        target = (data.get("target") or "").strip()
-
-        if not group_id or not target:
-            self.send_error_msg("group_id and target are required")
-            return
-
-        info = groups.get(group_id)
-        if not info:
-            self.send_error_msg("Group does not exist")
-            return
-
-        if self.username not in info.get("members", set()):
-            self.send_error_msg("You are not a member of this group")
-            return
-
-        info.setdefault("invites", set()).add(target)
-
-        send_to_user(
-            target,
-            {
-                "type": "group_invite",
-                "group_id": group_id,
-                "group_name": info.get("name") or group_id,
-                "from": self.username,
-            },
-        )
-
-    def handle_group_accept(self, data):
-        if not self.username:
-            self.send_error_msg("Not registered")
-            return
-
-        group_id = (data.get("group_id") or "").strip()
-        if not group_id:
-            self.send_error_msg("group_id is required")
-            return
-
-        info = groups.get(group_id)
-        if not info:
-            self.send_error_msg("Group does not exist")
-            return
-
-        invites = info.setdefault("invites", set())
-        if self.username not in invites:
-            self.send_error_msg("No invite for this group")
-            return
-
-        invites.discard(self.username)
-        info.setdefault("members", set()).add(self.username)
-
-        self.send(
-            {
-                "type": "group_joined",
-                "group_id": group_id,
-                "group_name": info.get("name") or group_id,
-                "members": list(info["members"]),
-            }
-        )
-
-    def handle_group_leave(self, data):
-        if not self.username:
-            self.send_error_msg("Not registered")
-            return
-
-        group_id = (data.get("group_id") or "").strip()
-        if not group_id:
-            self.send_error_msg("group_id is required")
-            return
-
-        info = groups.get(group_id)
-        if not info:
-            self.send_error_msg("Group does not exist")
-            return
-
-        members = info.setdefault("members", set())
-        if self.username not in members:
-            self.send_error_msg("You are not in this group")
-            return
-
-        members.discard(self.username)
-        if not members:
-            groups.pop(group_id, None)
-
-    def handle_group_chat(self, data):
-        if not self.username:
-            self.send_error_msg("Not registered")
-            return
-        if user_data.get(self.username, {}).get("hidden"):
-            self.send_error_msg("Hidden users cannot send group messages")
-            return
-
-        group_id = (data.get("group_id") or "").strip()
-        message = (data.get("message") or "").strip()
-
-        if not group_id or not message:
-            self.send_error_msg("group_id and message are required")
-            return
-        if len(message) > CONFIG["max_message_length"]:
-            self.send_error_msg("Message too long")
-            return
-
-        info = groups.get(group_id)
-        if not info:
-            self.send_error_msg("Group does not exist")
-            return
-
-        members = info.setdefault("members", set())
-        if self.username not in members:
-            self.send_error_msg("You are not in this group")
-            return
-
-        group_name = info.get("name") or group_id
-
-        payload = {
-            "type": "group_chat",
-            "group_id": group_id,
-            "group_name": group_name,
-            "from": self.username,
-            "message": message,
-        }
-
-        for member in list(members):
-            send_to_user(member, payload)
 
     def handle_remote_cmd(self, data):
         if not self.username:

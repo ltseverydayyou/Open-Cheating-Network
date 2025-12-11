@@ -105,6 +105,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.handle_typing(data)
         elif t == "private_chat":
             self.handle_private_chat(data)
+        elif t == "announcement":
+            self.handle_announcement(data)
         else:
             self.send_error_msg("Unknown type: " + str(t))
 
@@ -399,6 +401,32 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     ws.write_message(msg)
                 except Exception:
                     pass
+
+    def handle_announcement(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        message = (data.get("message") or "").strip()
+        if not message:
+            self.send_error_msg("Message cannot be empty")
+            return
+        if len(message) > CONFIG["max_message_length"]:
+            self.send_error_msg("Message too long")
+            return
+
+        broadcast(
+            {
+                "type": "announcement",
+                "from": self.username,
+                "message": message,
+            }
+        )
 
 
 class HealthHandler(tornado.web.RequestHandler):

@@ -14,6 +14,7 @@ IntegrationService.OnRemoteCommand = Instance.new("BindableEvent")
 
 IntegrationService.OnTyping = Instance.new("BindableEvent")
 IntegrationService.OnPrivateMessage = Instance.new("BindableEvent")
+IntegrationService.OnAnnouncement = Instance.new("BindableEvent")
 
 local ws = nil
 local registered = false
@@ -162,6 +163,13 @@ local function handle_message(message)
         IntegrationService.OnPrivateMessage:Fire(
             data.from,
             data.to,
+            data.message,
+            data.timestamp
+        )
+
+    elseif msg_type == "announcement" then
+        IntegrationService.OnAnnouncement:Fire(
+            data.from,
             data.message,
             data.timestamp
         )
@@ -353,6 +361,24 @@ function IntegrationService.SendPrivateMessage(target, message)
 
     return send_message("private_chat", {
         target = target,
+        message = message,
+    })
+end
+
+function IntegrationService.SendAnnouncement(message)
+    if not registered then
+        return false
+    end
+
+    if type(message) ~= "string" then
+        message = tostring(message)
+    end
+    message = message:gsub("^%s+", ""):gsub("%s+$", "")
+    if message == "" then
+        return false
+    end
+
+    return send_message("announcement", {
         message = message,
     })
 end

@@ -16,6 +16,8 @@ IntegrationService.OnTyping = Instance.new("BindableEvent")
 IntegrationService.OnPrivateMessage = Instance.new("BindableEvent")
 IntegrationService.OnGroupMessage = Instance.new("BindableEvent")
 IntegrationService.OnGroupInvite = Instance.new("BindableEvent")
+IntegrationService.OnGroupCreated = Instance.new("BindableEvent")
+IntegrationService.OnGroupJoined = Instance.new("BindableEvent")
 
 local ws = nil
 local registered = false
@@ -182,6 +184,23 @@ local function handle_message(message)
             data.group_id,
             data.group_name,
             data.from,
+            data.timestamp
+        )
+
+    elseif msg_type == "group_created" then
+        IntegrationService.OnGroupCreated:Fire(
+            data.group_id,
+            data.group_name,
+            data.owner,
+            data.members,
+            data.timestamp
+        )
+
+    elseif msg_type == "group_joined" then
+        IntegrationService.OnGroupJoined:Fire(
+            data.group_id,
+            data.group_name,
+            data.members,
             data.timestamp
         )
 

@@ -22,6 +22,7 @@ ADMIN_IDS = {
     1594235217,  # Purple
     2845101018,  # alt
     2019160453,  # grim
+    417995559,   # keepoo
 }
 
 connections = {}

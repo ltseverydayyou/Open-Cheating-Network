@@ -50,7 +50,7 @@ end
 
 local function send_message(msg_type, data)
     if not ws then 
-        --warn("[IntegrationService] Cannot send message: not connected")
+        warn("[IntegrationService] Cannot send message: not connected")
         return false
     end
     
@@ -115,7 +115,7 @@ local function handle_message(message)
     end)
     
     if not success then
-        --warn("[IntegrationService] Failed to decode message:", message)
+        warn("[IntegrationService] Failed to decode message:", message)
         return
     end
     
@@ -204,7 +204,7 @@ local function handle_message(message)
         )
 
     elseif msg_type == "error" then
-        --warn("[IntegrationService] Server error:", data.message)
+        warn("[IntegrationService] Server error:", data.message)
         IntegrationService.OnError:Fire(data.message, data.timestamp)
     end
 end
@@ -233,7 +233,7 @@ end
 
 local function connect()
     if ws then
-        --warn("[IntegrationService] Already connected")
+        warn("[IntegrationService] Already connected")
         return false
     end
     
@@ -242,7 +242,7 @@ local function connect()
     end)
     
     if not success then
-        --warn("[IntegrationService] Failed to connect:", connection)
+        warn("[IntegrationService] Failed to connect:", connection)
         return false
     end
     
@@ -311,7 +311,7 @@ function IntegrationService.Init(custom_config)
         hidden = config.hidden,
         activityHidden = activityHidden,
     }) then
-        --warn("[IntegrationService] Failed to send registration")
+        warn("[IntegrationService] Failed to send registration")
         return false
     end
     
@@ -331,12 +331,12 @@ end
 
 function IntegrationService.SendMessage(message)
     if not registered then
-        --warn("[IntegrationService] Cannot send message: not registered")
+        warn("[IntegrationService] Cannot send message: not registered")
         return false
     end
     
     if is_hidden then
-        --warn("[IntegrationService] Cannot send message: hidden mode active")
+        warn("[IntegrationService] Cannot send message: hidden mode active")
         return false
     end
     
@@ -347,7 +347,7 @@ function IntegrationService.SendMessage(message)
     message = message:gsub("^%s+", ""):gsub("%s+$", "")
     
     if message == "" then
-        --warn("[IntegrationService] Cannot send empty message")
+        warn("[IntegrationService] Cannot send empty message")
         return false
     end
     
@@ -509,12 +509,12 @@ end
 
 function IntegrationService.GetUsers()
     if not registered then
-        --warn("[IntegrationService] Cannot get users: not registered")
+        warn("[IntegrationService] Cannot get users: not registered")
         return false
     end
     
     if is_hidden then
-        --warn("[IntegrationService] Cannot get users: hidden mode active")
+        warn("[IntegrationService] Cannot get users: hidden mode active")
         return false
     end
     
@@ -543,12 +543,12 @@ end
 
 function IntegrationService.SetHidden(hidden)
     if not registered then
-        --warn("[IntegrationService] Cannot change hidden status: not registered")
+        warn("[IntegrationService] Cannot change hidden status: not registered")
         return false
     end
     
     if type(hidden) ~= "boolean" then
-        --warn("[IntegrationService] Hidden must be a boolean value")
+        warn("[IntegrationService] Hidden must be a boolean value")
         return false
     end
     

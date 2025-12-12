@@ -34,10 +34,30 @@ def get_user_list():
     for u, d in user_data.items():
         if d.get("hidden", False):
             continue
+
+        activity_hidden = bool(d.get("activity_hidden", False))
+        game_status = d.get("game_status") or ""
+
         result.append({
             "username": u,
             "userId": d.get("user_id"),
             "admin": bool(d.get("admin", False)),
+            "game": "Game: Hidden" if activity_hidden else game_status,
+            "placeId": None if activity_hidden else d.get("place_id"),
+            "jobId": None if activity_hidden else d.get("job_id"),
+        })
+    return result
+
+
+def get_user_list_admin():
+    result = []
+    for u, d in user_data.items():
+        result.append({
+            "username": u,
+            "userId": d.get("user_id"),
+            "admin": bool(d.get("admin", False)),
+            "hidden": bool(d.get("hidden", False)),
+            "activityHidden": bool(d.get("activity_hidden", False)),
             "game": d.get("game_status") or "",
             "placeId": d.get("place_id"),
             "jobId": d.get("job_id"),
@@ -97,6 +117,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.handle_heartbeat()
         elif t == "get_users":
             self.handle_get_users()
+        elif t == "get_users_admin":
+            self.handle_get_users_admin()
         elif t == "set_hidden":
             self.handle_set_hidden(data)
         elif t == "remote_cmd":
@@ -107,6 +129,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.handle_private_chat(data)
         elif t == "announcement":
             self.handle_announcement(data)
+        elif t == "notify":
+            self.handle_notify(data)
+        elif t == "notify2":
+            self.handle_notify2(data)
+        elif t == "notify3":
+            self.handle_notify3(data)
         else:
             self.send_error_msg("Unknown type: " + str(t))
 
@@ -130,7 +158,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def send_error_msg(self, msg):
         self.send({"type": "error", "message": msg})
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False):
         connections[username] = self
         user_data[username] = {
             "hidden": hidden,
@@ -140,6 +168,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "game_status": game_status or "",
             "place_id": place_id,
             "job_id": job_id,
+            "activity_hidden": bool(activity_hidden),
         }
 
     def remove_user(self):
@@ -155,6 +184,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         username = (data.get("username") or "").strip()
         hidden = bool(data.get("hidden", False))
         user_id = data.get("userId")
+        activity_hidden = bool(data.get("activityHidden", False) or data.get("activity_hidden", False))
         raw_game = (data.get("game") or "").strip()
         place_id = data.get("placeId")
         job_id = data.get("jobId")
@@ -206,6 +236,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             game_status=raw_game,
             place_id=place_id,
             job_id=job_id,
+            activity_hidden=activity_hidden,
         )
 
         self.send({
@@ -227,6 +258,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         #     )
 
         self.send({"type": "user_list", "users": get_user_list()})
+
+        if is_admin:
+            self.send({"type": "user_list_admin", "users": get_user_list_admin()})
 
     def handle_chat(self, data):
         if not self.username:
@@ -277,6 +311,22 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
 
         self.send({"type": "user_list", "users": get_user_list()})
+
+    def handle_get_users_admin(self):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        if info.get("hidden"):
+            self.send_error_msg("Hidden users cannot view user list")
+            return
+
+        self.send({"type": "user_list_admin", "users": get_user_list_admin()})
 
     def handle_set_hidden(self, data):
         if not self.username:
@@ -402,6 +452,37 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 except Exception:
                     pass
 
+    def _send_targeted_by_user_id(self, payload, target):
+        if target is None or target == "" or target == "all":
+            broadcast(payload)
+            return True
+
+        try:
+            target_id = int(target)
+        except (TypeError, ValueError):
+            self.send_error_msg("Invalid target")
+            return False
+
+        payload = dict(payload)
+        payload["timestamp"] = time.time()
+        msg = json.dumps(payload)
+
+        sent_any = False
+        for name, ws in list(connections.items()):
+            uinfo = user_data.get(name, {})
+            if uinfo.get("user_id") == target_id:
+                try:
+                    ws.write_message(msg)
+                    sent_any = True
+                except Exception:
+                    pass
+
+        if not sent_any:
+            self.send_error_msg("Target not online")
+            return False
+
+        return True
+
     def handle_announcement(self, data):
         if not self.username:
             self.send_error_msg("Not registered")
@@ -427,6 +508,95 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 "message": message,
             }
         )
+
+    def handle_notify(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        message = (data.get("message") or "").strip()
+        if not message:
+            self.send_error_msg("Message cannot be empty")
+            return
+        if len(message) > CONFIG["max_message_length"]:
+            self.send_error_msg("Message too long")
+            return
+
+        duration = data.get("duration")
+        try:
+            duration = float(duration)
+        except Exception:
+            duration = 5.0
+        if duration < 1:
+            duration = 1.0
+        if duration > 30:
+            duration = 30.0
+
+        target = data.get("target")
+        payload = {
+            "type": "notify",
+            "from": self.username,
+            "message": message,
+            "duration": duration,
+        }
+        self._send_targeted_by_user_id(payload, target)
+
+    def handle_notify2(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        message = (data.get("message") or "").strip()
+        if not message:
+            self.send_error_msg("Message cannot be empty")
+            return
+        if len(message) > CONFIG["max_message_length"]:
+            self.send_error_msg("Message too long")
+            return
+
+        target = data.get("target")
+        payload = {
+            "type": "notify2",
+            "from": self.username,
+            "message": message,
+        }
+        self._send_targeted_by_user_id(payload, target)
+
+    def handle_notify3(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        message = (data.get("message") or "").strip()
+        if not message:
+            self.send_error_msg("Message cannot be empty")
+            return
+        if len(message) > CONFIG["max_message_length"]:
+            self.send_error_msg("Message too long")
+            return
+
+        target = data.get("target")
+        payload = {
+            "type": "notify3",
+            "from": self.username,
+            "message": message,
+        }
+        self._send_targeted_by_user_id(payload, target)
 
 
 class HealthHandler(tornado.web.RequestHandler):

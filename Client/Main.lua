@@ -7,6 +7,7 @@ IntegrationService.__index = IntegrationService
 IntegrationService.OnChatMessage = Instance.new("BindableEvent")
 IntegrationService.OnSystemMessage = Instance.new("BindableEvent")
 IntegrationService.OnUserListUpdate = Instance.new("BindableEvent")
+IntegrationService.OnUserListUpdateAdmin = Instance.new("BindableEvent")
 IntegrationService.OnConnected = Instance.new("BindableEvent")
 IntegrationService.OnDisconnected = Instance.new("BindableEvent")
 IntegrationService.OnError = Instance.new("BindableEvent")
@@ -15,6 +16,9 @@ IntegrationService.OnRemoteCommand = Instance.new("BindableEvent")
 IntegrationService.OnTyping = Instance.new("BindableEvent")
 IntegrationService.OnPrivateMessage = Instance.new("BindableEvent")
 IntegrationService.OnAnnouncement = Instance.new("BindableEvent")
+IntegrationService.OnNotify = Instance.new("BindableEvent")
+IntegrationService.OnNotify2 = Instance.new("BindableEvent")
+IntegrationService.OnNotify3 = Instance.new("BindableEvent")
 
 local ws = nil
 local registered = false
@@ -133,6 +137,9 @@ local function handle_message(message)
         
     elseif msg_type == "user_list" then
         IntegrationService.OnUserListUpdate:Fire(data.users, data.timestamp)
+
+    elseif msg_type == "user_list_admin" then
+        IntegrationService.OnUserListUpdateAdmin:Fire(data.users, data.timestamp)
         
     elseif msg_type == "heartbeat_ack" then
         -- ignore, used only to keep connection alive
@@ -169,6 +176,28 @@ local function handle_message(message)
 
     elseif msg_type == "announcement" then
         IntegrationService.OnAnnouncement:Fire(
+            data.from,
+            data.message,
+            data.timestamp
+        )
+
+    elseif msg_type == "notify" then
+        IntegrationService.OnNotify:Fire(
+            data.from,
+            data.message,
+            data.duration,
+            data.timestamp
+        )
+
+    elseif msg_type == "notify2" then
+        IntegrationService.OnNotify2:Fire(
+            data.from,
+            data.message,
+            data.timestamp
+        )
+
+    elseif msg_type == "notify3" then
+        IntegrationService.OnNotify3:Fire(
             data.from,
             data.message,
             data.timestamp
@@ -255,18 +284,16 @@ function IntegrationService.Init(custom_config)
     username = player.Name --nameChecker(player)
     local userId = player.UserId
 
-    local gameStatus = nil
-    local placeIdForShare = nil
-    local jobIdForShare = nil
+    local gameStatus = getGameStatus()
+    local placeIdForShare = game.PlaceId
+    local jobIdForShare = tostring(game.JobId)
+
+    local activityHidden = false
     local okGameFlag, flag = pcall(function()
         return _G.NAChatGameActivityEnabled and _G.NAChatGameActivityEnabled()
     end)
-    if not (okGameFlag and flag == false) then
-        gameStatus = getGameStatus()
-        placeIdForShare = game.PlaceId
-        jobIdForShare = tostring(game.JobId)
-    else
-        gameStatus = "Game: Hidden"
+    if okGameFlag and flag == false then
+        activityHidden = true
     end
     
     if not connect() then
@@ -281,7 +308,8 @@ function IntegrationService.Init(custom_config)
         game = gameStatus,
         placeId = placeIdForShare,
         jobId = jobIdForShare,
-        hidden = config.hidden
+        hidden = config.hidden,
+        activityHidden = activityHidden,
     }) then
         --warn("[IntegrationService] Failed to send registration")
         return false
@@ -383,6 +411,102 @@ function IntegrationService.SendAnnouncement(message)
     })
 end
 
+function IntegrationService.SendNotify(target, message, duration)
+    if not registered or not ws then
+        return false
+    end
+
+    if type(message) ~= "string" then
+        message = tostring(message)
+    end
+    message = message:gsub("^%s+", ""):gsub("%s+$", "")
+    if message == "" then
+        return false
+    end
+
+    local dur = tonumber(duration) or 5
+
+    local t
+    if target == nil or target == "" or target == "all" then
+        t = "all"
+    else
+        local n = tonumber(target)
+        if n then
+            t = n
+        else
+            t = tostring(target)
+        end
+    end
+
+    return send_message("notify", {
+        target = t,
+        message = message,
+        duration = dur,
+    })
+end
+
+function IntegrationService.SendNotify2(target, message)
+    if not registered or not ws then
+        return false
+    end
+
+    if type(message) ~= "string" then
+        message = tostring(message)
+    end
+    message = message:gsub("^%s+", ""):gsub("%s+$", "")
+    if message == "" then
+        return false
+    end
+
+    local t
+    if target == nil or target == "" or target == "all" then
+        t = "all"
+    else
+        local n = tonumber(target)
+        if n then
+            t = n
+        else
+            t = tostring(target)
+        end
+    end
+
+    return send_message("notify2", {
+        target = t,
+        message = message,
+    })
+end
+
+function IntegrationService.SendNotify3(target, message)
+    if not registered or not ws then
+        return false
+    end
+
+    if type(message) ~= "string" then
+        message = tostring(message)
+    end
+    message = message:gsub("^%s+", ""):gsub("%s+$", "")
+    if message == "" then
+        return false
+    end
+
+    local t
+    if target == nil or target == "" or target == "all" then
+        t = "all"
+    else
+        local n = tonumber(target)
+        if n then
+            t = n
+        else
+            t = tostring(target)
+        end
+    end
+
+    return send_message("notify3", {
+        target = t,
+        message = message,
+    })
+end
+
 function IntegrationService.GetUsers()
     if not registered then
         --warn("[IntegrationService] Cannot get users: not registered")
@@ -395,6 +519,18 @@ function IntegrationService.GetUsers()
     end
     
     return send_message("get_users")
+end
+
+function IntegrationService.GetUsersAdmin()
+    if not registered then
+        return false
+    end
+
+    if is_hidden then
+        return false
+    end
+
+    return send_message("get_users_admin")
 end
 
 function IntegrationService.IsConnected()

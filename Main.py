@@ -24,9 +24,12 @@ ADMIN_IDS = {
     2019160453,  # grim
 }
 
-connections = {}      # username -> WebSocketHandler
-user_data = {}        # username -> {hidden, last_seen, ...}
-ip_users = {}         # ip -> set(usernames)
+connections = {}
+user_data = {}
+ip_users = {}
+
+banned_users = set()
+muted_until = {}
 
 
 def get_user_list():
@@ -47,6 +50,69 @@ def get_user_list():
             "jobId": None if activity_hidden else d.get("job_id"),
         })
     return result
+
+
+def is_banned(username: str) -> bool:
+    if not username:
+        return False
+    return username.lower() in banned_users
+
+
+def ban_user(username: str):
+    if username:
+        banned_users.add(username.lower())
+
+
+def unban_user(username: str):
+    if username:
+        banned_users.discard(username.lower())
+
+
+def get_ban_list():
+    return sorted(banned_users)
+
+
+def is_muted(username: str) -> bool:
+    if not username:
+        return False
+    key = username.lower()
+    until = muted_until.get(key)
+    if not until:
+        return False
+    now = time.time()
+    if now >= until:
+        muted_until.pop(key, None)
+        return False
+    return True
+
+
+def mute_user(username: str, duration_seconds: float):
+    if not username:
+        return
+    try:
+        duration = float(duration_seconds)
+    except Exception:
+        duration = 0.0
+    if duration <= 0:
+        unmute_user(username)
+        return
+    muted_until[username.lower()] = time.time() + duration
+
+
+def unmute_user(username: str):
+    if username:
+        muted_until.pop(username.lower(), None)
+
+
+def get_mute_list():
+    now = time.time()
+    out = []
+    for name, until in list(muted_until.items()):
+        if until and until > now:
+            out.append({"username": name, "until": until})
+        else:
+            muted_until.pop(name, None)
+    return out
 
 
 def get_user_list_admin():
@@ -135,6 +201,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.handle_notify2(data)
         elif t == "notify3":
             self.handle_notify3(data)
+        elif t == "admin_action":
+            self.handle_admin_action(data)
         else:
             self.send_error_msg("Unknown type: " + str(t))
 
@@ -213,6 +281,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             )
             return
 
+        if is_banned(username):
+            self.send_error_msg("You are banned from NA Chat")
+            try:
+                self.close(4003, "Banned from NA Chat")
+            except Exception:
+                pass
+            return
+
         if username in connections and connections[username] is not self:
             try:
                 connections[username].close(1000, "Replaced")
@@ -268,6 +344,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         if user_data.get(self.username, {}).get("hidden"):
             self.send_error_msg("Hidden users cannot send messages")
+            return
+        if is_banned(self.username):
+            self.send_error_msg("You are banned from NA Chat")
+            return
+        if is_muted(self.username):
+            self.send_error_msg("You are muted in NA Chat")
             return
 
         msg = (data.get("message") or "").strip()
@@ -376,6 +458,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         if user_data.get(self.username, {}).get("hidden"):
             self.send_error_msg("Hidden users cannot send private messages")
+            return
+        if is_banned(self.username):
+            self.send_error_msg("You are banned from NA Chat")
+            return
+        if is_muted(self.username):
+            self.send_error_msg("You are muted in NA Chat")
             return
 
         message = (data.get("message") or "").strip()
@@ -597,6 +685,101 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "message": message,
         }
         self._send_targeted_by_user_id(payload, target)
+
+    def handle_admin_action(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized for admin actions")
+            return
+
+        action = (data.get("action") or "").strip().lower()
+        target = (data.get("target") or "").strip()
+        duration = data.get("duration", 0)
+
+        if not action:
+            self.send_error_msg("Missing action")
+            return
+
+        if action in ("kick", "ban", "unban", "mute", "unmute") and not target:
+            self.send_error_msg("Missing target")
+            return
+
+        if target == self.username and action in ("ban", "kick"):
+            self.send_error_msg("You cannot target yourself")
+            return
+
+        if action == "kick":
+            ws = connections.get(target)
+            if not ws:
+                self.send_error_msg("Target not found")
+            else:
+                try:
+                    ws.close(4000, "Kicked from NA Chat")
+                except Exception:
+                    pass
+                broadcast(
+                    {
+                        "type": "system",
+                        "message": f"{target} was kicked from NA Chat",
+                    }
+                )
+
+        elif action == "ban":
+            ban_user(target)
+            ws = connections.get(target)
+            if ws:
+                try:
+                    ws.close(4001, "Banned from NA Chat")
+                except Exception:
+                    pass
+            broadcast(
+                {
+                    "type": "system",
+                    "message": f"{target} was banned from NA Chat",
+                }
+            )
+
+        elif action == "unban":
+            unban_user(target)
+            self.send({"type": "system", "message": f"{target} was unbanned from NA Chat"})
+
+        elif action == "mute":
+            if not duration:
+                duration = 300
+            mute_user(target, duration)
+            broadcast(
+                {
+                    "type": "system",
+                    "message": f"{target} was muted in NA Chat",
+                }
+            )
+
+        elif action == "unmute":
+            unmute_user(target)
+            broadcast(
+                {
+                    "type": "system",
+                    "message": f"{target} was unmuted in NA Chat",
+                }
+            )
+
+        elif action == "refresh":
+            pass
+        else:
+            self.send_error_msg("Unknown admin action")
+            return
+
+        self.send(
+            {
+                "type": "admin_state",
+                "banned": get_ban_list(),
+                "muted": get_mute_list(),
+            }
+        )
 
 
 class HealthHandler(tornado.web.RequestHandler):

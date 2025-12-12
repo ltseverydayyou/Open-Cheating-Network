@@ -19,6 +19,7 @@ IntegrationService.OnAnnouncement = Instance.new("BindableEvent")
 IntegrationService.OnNotify = Instance.new("BindableEvent")
 IntegrationService.OnNotify2 = Instance.new("BindableEvent")
 IntegrationService.OnNotify3 = Instance.new("BindableEvent")
+IntegrationService.OnAdminState = Instance.new("BindableEvent")
 
 local ws = nil
 local registered = false
@@ -282,6 +283,9 @@ local function handle_message(message)
             data.message,
             data.timestamp
         )
+
+    elseif msg_type == "admin_state" then
+        IntegrationService.OnAdminState:Fire(data)
 
     elseif msg_type == "error" then
         warn("[IntegrationService] Server error:", data.message)
@@ -711,6 +715,33 @@ function IntegrationService.SendRemoteCommand(target, args)
         target = t,
         args = clean,
     })
+end
+
+function IntegrationService.SendAdminAction(action, target, duration)
+    if not registered or not ws then
+        return false
+    end
+
+    action = tostring(action or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    target = tostring(target or ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+    if action == "" then
+        return false
+    end
+
+    local payload = {
+        action = action,
+        target = target,
+    }
+
+    if duration ~= nil then
+        local n = tonumber(duration)
+        if n and n > 0 then
+            payload.duration = n
+        end
+    end
+
+    return send_message("admin_action", payload)
 end
 
 return IntegrationService

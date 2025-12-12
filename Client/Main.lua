@@ -35,6 +35,63 @@ local config = {
     hidden = false
 }
 
+local lastDecodeWarnText = nil
+local lastDecodeWarnTime = 0
+
+local function getEnv()
+    local ok, env = pcall(function()
+        local g = getgenv
+        if type(g) == "function" then
+            return g()
+        end
+    end)
+
+    if ok and type(env) == "table" then
+        return env
+    end
+
+    return _G
+end
+
+local resolvedWebSocketConnect = nil
+
+local function resolveWebSocketConnect()
+    if resolvedWebSocketConnect ~= nil then
+        return resolvedWebSocketConnect
+    end
+
+    local env = getEnv()
+
+    local function tryContainer(container)
+        if type(container) == "table" then
+            if type(container.connect) == "function" then
+                resolvedWebSocketConnect = container.connect
+            elseif type(container.Connect) == "function" then
+                resolvedWebSocketConnect = container.Connect
+            end
+        elseif type(container) == "function" and resolvedWebSocketConnect == nil then
+            resolvedWebSocketConnect = container
+        end
+    end
+
+    tryContainer(env.WebSocket or (_G and _G.WebSocket))
+    tryContainer(env.websocket or (_G and _G.websocket))
+
+    if type(env.syn) == "table" then
+        tryContainer(env.syn.websocket or env.syn.WebSocket)
+    end
+
+    if type(env.http) == "table" then
+        tryContainer(env.http.websocket or env.http.WebSocket)
+    end
+
+    if type(env.solara) == "table" then
+        tryContainer(env.solara.websocket or env.solara.WebSocket)
+    end
+
+    return resolvedWebSocketConnect
+end
+
 local function getGameStatus()
     local ok, result = pcall(function()
         local placeId = game.PlaceId
@@ -70,6 +127,7 @@ local function send_message(msg_type, data)
     end)
     
     if not success then
+        warn("[IntegrationService] Failed to encode message:", tostring(json))
         return false
     end
     
@@ -109,13 +167,35 @@ local function nameChecker(p)
 end
 
 local function handle_message(message)
-    
+    if typeof(message) == "table" and message.data then
+        message = message.data
+    end
+
+    if type(message) ~= "string" then
+        return
+    end
+
+    local trimmed = message:match("^%s*(.-)%s*$")
+    if trimmed == "" then
+        return
+    end
+
+    local firstChar = trimmed:sub(1, 1)
+    if firstChar ~= "{" and firstChar ~= "[" then
+        return
+    end
+
     local success, data = pcall(function()
-        return HttpService:JSONDecode(message)
+        return HttpService:JSONDecode(trimmed)
     end)
     
     if not success then
-        warn("[IntegrationService] Failed to decode message:", message)
+        local now = os.clock()
+        if (now - (lastDecodeWarnTime or 0)) > 10 or trimmed ~= lastDecodeWarnText then
+            lastDecodeWarnText = trimmed
+            lastDecodeWarnTime = now
+            warn("[IntegrationService] Failed to decode message:", trimmed)
+        end
         return
     end
     
@@ -234,16 +314,20 @@ end
 local function connect()
     if ws then
         warn("[IntegrationService] Already connected")
-        return false
+        return false, "already_connected"
     end
     
-    local success, connection = pcall(function()
-        return WebSocket.connect(config.serverUrl)
-    end)
+    local connector = resolveWebSocketConnect()
+    if type(connector) ~= "function" then
+        warn("[IntegrationService] WebSocket API not available in this executor")
+        return false, "websocket_not_available"
+    end
+
+    local success, connection = pcall(connector, config.serverUrl)
     
     if not success then
         warn("[IntegrationService] Failed to connect:", connection)
-        return false
+        return false, tostring(connection or "connect_failed")
     end
     
     ws = connection
@@ -278,7 +362,7 @@ function IntegrationService.Init(custom_config)
     
     local player = Players.LocalPlayer
     if not player then
-        return false
+        return false, "no_local_player"
     end
     
     username = player.Name --nameChecker(player)
@@ -296,8 +380,9 @@ function IntegrationService.Init(custom_config)
         activityHidden = true
     end
     
-    if not connect() then
-        return false
+    local okConnect, connectErr = connect()
+    if not okConnect then
+        return false, connectErr or "connect_failed"
     end
     
     task.wait(0.5)
@@ -312,7 +397,7 @@ function IntegrationService.Init(custom_config)
         activityHidden = activityHidden,
     }) then
         warn("[IntegrationService] Failed to send registration")
-        return false
+        return false, "register_failed"
     end
     
     task.wait(1)

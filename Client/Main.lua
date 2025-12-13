@@ -289,7 +289,7 @@ local function handle_message(message)
 
     elseif msg_type == "error" then
         warn("[IntegrationService] Server error:", data.message)
-        IntegrationService.OnError:Fire(data.message, data.timestamp)
+        IntegrationService.OnError:Fire(data.message, data.timestamp, data)
     end
 end
 
@@ -717,13 +717,14 @@ function IntegrationService.SendRemoteCommand(target, args)
     })
 end
 
-function IntegrationService.SendAdminAction(action, target, duration)
+function IntegrationService.SendAdminAction(action, target, duration, reason)
     if not registered or not ws then
         return false
     end
 
     action = tostring(action or ""):gsub("^%s+", ""):gsub("%s+$", "")
     target = tostring(target or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    reason = tostring(reason or ""):gsub("^%s+", ""):gsub("%s+$", "")
 
     if action == "" then
         return false
@@ -739,6 +740,10 @@ function IntegrationService.SendAdminAction(action, target, duration)
         if n and n > 0 then
             payload.duration = n
         end
+    end
+
+    if reason ~= "" then
+        payload.reason = reason
     end
 
     return send_message("admin_action", payload)

@@ -30,6 +30,7 @@ user_data = {}
 ip_users = {}
 
 banned_users = set()
+# username(lower) -> {"until": float, "reason": str}
 muted_until = {}
 
 
@@ -73,21 +74,36 @@ def get_ban_list():
     return sorted(banned_users)
 
 
-def is_muted(username: str) -> bool:
+def get_mute_info(username: str):
     if not username:
-        return False
+        return None
     key = username.lower()
-    until = muted_until.get(key)
-    if not until:
-        return False
-    now = time.time()
-    if now >= until:
+    entry = muted_until.get(key)
+    if not entry:
+        return None
+    if isinstance(entry, dict):
+        until = entry.get("until")
+        reason = entry.get("reason") or ""
+    else:
+        until = entry
+        reason = ""
+    try:
+        until_val = float(until)
+    except Exception:
         muted_until.pop(key, None)
-        return False
-    return True
+        return None
+    now = time.time()
+    if now >= until_val:
+        muted_until.pop(key, None)
+        return None
+    return {"until": until_val, "reason": str(reason)}
 
 
-def mute_user(username: str, duration_seconds: float):
+def is_muted(username: str) -> bool:
+    return get_mute_info(username) is not None
+
+
+def mute_user(username: str, duration_seconds: float, reason: str = ""):
     if not username:
         return
     try:
@@ -97,7 +113,7 @@ def mute_user(username: str, duration_seconds: float):
     if duration <= 0:
         unmute_user(username)
         return
-    muted_until[username.lower()] = time.time() + duration
+    muted_until[username.lower()] = {"until": time.time() + duration, "reason": (reason or "")[:200]}
 
 
 def unmute_user(username: str):
@@ -108,9 +124,11 @@ def unmute_user(username: str):
 def get_mute_list():
     now = time.time()
     out = []
-    for name, until in list(muted_until.items()):
+    for name, entry in list(muted_until.items()):
+        until = entry.get("until") if isinstance(entry, dict) else entry
+        reason = entry.get("reason") if isinstance(entry, dict) else ""
         if until and until > now:
-            out.append({"username": name, "until": until})
+            out.append({"username": name, "until": until, "reason": reason or ""})
         else:
             muted_until.pop(name, None)
     return out
@@ -224,8 +242,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         except Exception:
             pass
 
-    def send_error_msg(self, msg):
-        self.send({"type": "error", "message": msg})
+    def send_error_msg(self, msg, code=None, **extra):
+        payload = {"type": "error", "message": msg}
+        if code:
+            payload["code"] = code
+        payload.update(extra or {})
+        self.send(payload)
 
     def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False):
         connections[username] = self
@@ -349,8 +371,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_banned(self.username):
             self.send_error_msg("You are banned from NA Chat")
             return
-        if is_muted(self.username):
-            self.send_error_msg("You are muted in NA Chat")
+        mute_info = get_mute_info(self.username)
+        if mute_info:
+            remaining = int(max(0, mute_info["until"] - time.time()))
+            msg = f"You are muted in NA Chat ({remaining}s left)"
+            if mute_info["reason"]:
+                msg += f" - {mute_info['reason']}"
+            self.send_error_msg(msg, code="muted", until=mute_info["until"], reason=mute_info["reason"])
             return
 
         msg = (data.get("message") or "").strip()
@@ -463,8 +490,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_banned(self.username):
             self.send_error_msg("You are banned from NA Chat")
             return
-        if is_muted(self.username):
-            self.send_error_msg("You are muted in NA Chat")
+        mute_info = get_mute_info(self.username)
+        if mute_info:
+            remaining = int(max(0, mute_info["until"] - time.time()))
+            msg = f"You are muted in NA Chat ({remaining}s left)"
+            if mute_info["reason"]:
+                msg += f" - {mute_info['reason']}"
+            self.send_error_msg(msg, code="muted", until=mute_info["until"], reason=mute_info["reason"])
             return
 
         message = (data.get("message") or "").strip()
@@ -751,11 +783,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         elif action == "mute":
             if not duration:
                 duration = 300
-            mute_user(target, duration)
+            reason = (data.get("reason") or "").strip()
+            mute_user(target, duration, reason=reason)
+            reason_suffix = f" - {reason}" if reason else ""
             broadcast(
                 {
                     "type": "system",
-                    "message": f"{target} was muted in NA Chat",
+                    "message": f"{target} was muted in NA Chat ({int(duration)}s){reason_suffix}",
                 }
             )
 

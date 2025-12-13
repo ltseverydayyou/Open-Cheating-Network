@@ -209,6 +209,8 @@ local function handle_message(message)
         is_hidden = data.hidden or false
         
         IntegrationService.OnConnected:Fire(username, token, is_hidden, data.userId, data.admin, data.game)
+
+        start_heartbeat()
         
     elseif msg_type == "chat" then
         IntegrationService.OnChatMessage:Fire(data.username, data.message, data.timestamp, data.userId, data.admin, data.game)
@@ -338,7 +340,9 @@ local function connect()
     
     ws.OnMessage:Connect(handle_message)
     
-    ws.OnClose:Connect(function()
+    ws.OnClose:Connect(function(...)
+        local a = { ... }
+        warn("[IntegrationService] WS closed:", tostring(a[1]), tostring(a[2]))
         registered = false
         stop_heartbeat()
         
@@ -405,9 +409,6 @@ function IntegrationService.Init(custom_config)
     end
     
     task.wait(1)
-    if registered then
-        start_heartbeat()
-    end
     
     game:GetService("Players").LocalPlayer.AncestryChanged:Connect(function(_, parent)
         if not parent then

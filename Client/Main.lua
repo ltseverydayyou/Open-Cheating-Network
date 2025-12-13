@@ -28,6 +28,7 @@ local token = nil
 local reconnecting = false
 local heartbeat_thread = nil
 local is_hidden = false
+local start_heartbeat
 local config = {
     serverUrl = "wss://witty-minette-adonis-632b17c0.koyeb.app/swimhub",
     heartbeatInterval = 5,
@@ -295,11 +296,11 @@ local function handle_message(message)
     end
 end
 
-local function start_heartbeat()
+start_heartbeat = function()
     if heartbeat_thread then
         task.cancel(heartbeat_thread)
     end
-    
+
     heartbeat_thread = task.spawn(function()
         while registered and ws do
             task.wait(config.heartbeatInterval)

@@ -338,7 +338,20 @@ local function connect()
     
     ws = connection
     
-    ws.OnMessage:Connect(handle_message)
+    ws.OnMessage:Connect(function(msg)
+        local ok, err = pcall(handle_message, msg)
+        if not ok then
+            warn("[IntegrationService] handle_message error:", tostring(err), " typeof:", typeof(msg))
+            if type(msg) == "string" then
+                warn("[IntegrationService] raw:", msg:sub(1, math.min(#msg, 300)))
+            elseif typeof(msg) == "table" then
+                local okj, j = pcall(HttpService.JSONEncode, HttpService, msg)
+                if okj then
+                    warn("[IntegrationService] raw(table):", tostring(j):sub(1, 300))
+                end
+            end
+        end
+    end)
     
     ws.OnClose:Connect(function(...)
         local a = { ... }

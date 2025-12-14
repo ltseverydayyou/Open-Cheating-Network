@@ -4,25 +4,27 @@ import time
 import tornado.ioloop
 import tornado.web
 import tornado.websocket
+import tornado.httpclient
 
 CONFIG = {
-    "max_username_length": 50,
     "max_message_length": 500,
     "heartbeat_timeout": 90,
     "max_game_name_length": 80,
+    "rb_lookup_timeout": 6.0,
+    "rb_cache_seconds": 600,
 }
 
 ADMIN_IDS = {
-    11761417,    # Main
-    530829101,   # Viper
-    817571515,   # Aimlock
-    1844177730,  # glexinator
-    2624269701,  # Akim
-    2502806181,  # Main Alt
-    1594235217,  # Purple
-    2845101018,  # alt
-    2019160453,  # grim
-    417995559,   # keepoo
+    11761417,
+    530829101,
+    817571515,
+    1844177730,
+    2624269701,
+    2502806181,
+    1594235217,
+    2845101018,
+    2019160453,
+    417995559,
 }
 
 connections = {}
@@ -30,28 +32,13 @@ user_data = {}
 ip_users = {}
 
 banned_users = set()
-# username(lower) -> {"until": float, "reason": str}
 muted_until = {}
 
+_rb_cache = {}
 
-def get_user_list():
-    result = []
-    for u, d in user_data.items():
-        if d.get("hidden", False):
-            continue
 
-        activity_hidden = bool(d.get("activity_hidden", False))
-        game_status = d.get("game_status") or ""
-
-        result.append({
-            "username": u,
-            "userId": d.get("user_id"),
-            "admin": bool(d.get("admin", False)),
-            "game": "Game: Hidden" if activity_hidden else game_status,
-            "placeId": None if activity_hidden else d.get("place_id"),
-            "jobId": None if activity_hidden else d.get("job_id"),
-        })
-    return result
+def _now():
+    return time.time()
 
 
 def is_banned(username: str) -> bool:
@@ -92,15 +79,11 @@ def get_mute_info(username: str):
     except Exception:
         muted_until.pop(key, None)
         return None
-    now = time.time()
+    now = _now()
     if now >= until_val:
         muted_until.pop(key, None)
         return None
     return {"until": until_val, "reason": str(reason)}
-
-
-def is_muted(username: str) -> bool:
-    return get_mute_info(username) is not None
 
 
 def mute_user(username: str, duration_seconds: float, reason: str = ""):
@@ -113,7 +96,7 @@ def mute_user(username: str, duration_seconds: float, reason: str = ""):
     if duration <= 0:
         unmute_user(username)
         return
-    muted_until[username.lower()] = {"until": time.time() + duration, "reason": (reason or "")[:200]}
+    muted_until[username.lower()] = {"until": _now() + duration, "reason": (reason or "")[:200]}
 
 
 def unmute_user(username: str):
@@ -122,7 +105,7 @@ def unmute_user(username: str):
 
 
 def get_mute_list():
-    now = time.time()
+    now = _now()
     out = []
     for name, entry in list(muted_until.items()):
         until = entry.get("until") if isinstance(entry, dict) else entry
@@ -134,24 +117,8 @@ def get_mute_list():
     return out
 
 
-def get_user_list_admin():
-    result = []
-    for u, d in user_data.items():
-        result.append({
-            "username": u,
-            "userId": d.get("user_id"),
-            "admin": bool(d.get("admin", False)),
-            "hidden": bool(d.get("hidden", False)),
-            "activityHidden": bool(d.get("activity_hidden", False)),
-            "game": d.get("game_status") or "",
-            "placeId": d.get("place_id"),
-            "jobId": d.get("job_id"),
-        })
-    return result
-
-
 def broadcast(obj, exclude=None):
-    obj["timestamp"] = time.time()
+    obj["timestamp"] = _now()
     msg = json.dumps(obj)
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
@@ -163,17 +130,115 @@ def broadcast(obj, exclude=None):
 
 
 def send_to_user(username, obj):
-    """Utility to send a JSON-able object to a single user."""
     ws = connections.get(username)
     if not ws:
         return False
     obj = dict(obj)
-    obj["timestamp"] = time.time()
+    obj["timestamp"] = _now()
     try:
         ws.write_message(json.dumps(obj))
         return True
     except Exception:
         return False
+
+
+def get_user_list():
+    result = []
+    for u, d in user_data.items():
+        if d.get("hidden", False):
+            continue
+
+        activity_hidden = bool(d.get("activity_hidden", False))
+        game_status = d.get("game_status") or ""
+
+        result.append({
+            "username": u,
+            "displayName": d.get("display_name") or "",
+            "userId": d.get("user_id"),
+            "admin": bool(d.get("admin", False)),
+            "game": "Game: Hidden" if activity_hidden else game_status,
+            "placeId": None if activity_hidden else d.get("place_id"),
+            "jobId": None if activity_hidden else d.get("job_id"),
+        })
+    return result
+
+
+def get_user_list_admin():
+    result = []
+    for u, d in user_data.items():
+        result.append({
+            "username": u,
+            "displayName": d.get("display_name") or "",
+            "userId": d.get("user_id"),
+            "admin": bool(d.get("admin", False)),
+            "hidden": bool(d.get("hidden", False)),
+            "activityHidden": bool(d.get("activity_hidden", False)),
+            "game": d.get("game_status") or "",
+            "placeId": d.get("place_id"),
+            "jobId": d.get("job_id"),
+        })
+    return result
+
+
+async def rb_lookup_user(user_id: int):
+    if not isinstance(user_id, int) or user_id <= 0:
+        return None, None
+
+    ent = _rb_cache.get(user_id)
+    if ent and isinstance(ent, dict):
+        if ent.get("exp", 0) > _now():
+            return ent.get("name"), ent.get("dname")
+
+    url = f"https://users.roblox.com/v1/users/{user_id}"
+    cli = tornado.httpclient.AsyncHTTPClient()
+
+    try:
+        req = tornado.httpclient.HTTPRequest(
+            url=url,
+            method="GET",
+            request_timeout=CONFIG["rb_lookup_timeout"],
+            connect_timeout=CONFIG["rb_lookup_timeout"],
+            follow_redirects=True,
+            headers={"User-Agent": "NAChat/1.0"},
+        )
+        resp = await cli.fetch(req, raise_error=False)
+        if not resp or resp.code != 200 or not resp.body:
+            return None, None
+
+        data = json.loads(resp.body.decode("utf-8", "ignore"))
+        name = data.get("name")
+        dname = data.get("displayName")
+
+        if isinstance(name, str) and name:
+            _rb_cache[user_id] = {
+                "name": name,
+                "dname": dname if isinstance(dname, str) else "",
+                "exp": _now() + float(CONFIG["rb_cache_seconds"]),
+            }
+            return name, (dname if isinstance(dname, str) else "")
+    except Exception:
+        pass
+
+    return None, None
+
+
+def is_admin_auth(user_id, auth):
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+
+    if uid not in ADMIN_IDS:
+        return False
+
+    if not isinstance(auth, str) or not auth:
+        return False
+
+    key = os.environ.get(f"ADMIN_KEY_{uid}", "")
+    if not key:
+        return False
+
+    return auth == key
 
 
 class IntegrationHandler(tornado.websocket.WebSocketHandler):
@@ -185,7 +250,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         self.ip = self.request.remote_ip
         print("new connection from", self.ip)
 
-    def on_message(self, message):
+    async def on_message(self, message):
         try:
             data = json.loads(message)
         except Exception:
@@ -195,7 +260,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         t = data.get("type")
 
         if t == "register":
-            self.handle_register(data)
+            await self.handle_register(data)
         elif t == "chat":
             self.handle_chat(data)
         elif t == "heartbeat":
@@ -228,15 +293,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def on_close(self):
         if self.username:
             print(self.username, "disconnected")
-            hidden = user_data.get(self.username, {}).get("hidden", False)
             self.remove_user()
-            # if not hidden:
-            #     broadcast({"type": "system", "message": f"{self.username} left the chat"})
-
-    # ---------- helpers ----------
 
     def send(self, obj):
-        obj["timestamp"] = time.time()
+        obj["timestamp"] = _now()
         try:
             self.write_message(json.dumps(obj))
         except Exception:
@@ -249,17 +309,18 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name=""):
         connections[username] = self
         user_data[username] = {
             "hidden": hidden,
-            "last_seen": time.time(),
+            "last_seen": _now(),
             "user_id": user_id,
             "admin": bool(is_admin),
             "game_status": game_status or "",
             "place_id": place_id,
             "job_id": job_id,
             "activity_hidden": bool(activity_hidden),
+            "display_name": display_name or "",
         }
 
     def remove_user(self):
@@ -269,12 +330,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         connections.pop(u, None)
         user_data.pop(u, None)
 
-    # ---------- handlers ----------
-
-    def handle_register(self, data):
-        username = (data.get("username") or "").strip()
+    async def handle_register(self, data):
         hidden = bool(data.get("hidden", False))
-        user_id = data.get("userId")
         activity_hidden = bool(data.get("activityHidden", False) or data.get("activity_hidden", False))
         raw_game = (data.get("game") or "").strip()
         place_id = data.get("placeId")
@@ -283,26 +340,23 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
 
-        if not username or len(username) > CONFIG["max_username_length"]:
-            self.send_error_msg(
-                f"Username must be 1-{CONFIG['max_username_length']} characters"
-            )
+        user_id = data.get("userId")
+        try:
+            user_id = int(user_id)
+        except Exception:
+            self.send_error_msg("Invalid userId")
             return
 
-        cleaned = (
-            username
-            .replace("_", "")
-            .replace(" ", "")
-            .replace("(", "")
-            .replace(")", "")
-            .replace("@", "")
-        )
-
-        if not cleaned.isalnum():
-            self.send_error_msg(
-                "Username contains invalid characters (only letters, numbers, _, space, @, ( ) allowed)"
-            )
+        if user_id <= 0:
+            self.send_error_msg("Invalid userId")
             return
+
+        rb_name, rb_dname = await rb_lookup_user(user_id)
+        if not rb_name:
+            rb_name = f"UserId:{user_id}"
+            rb_dname = ""
+
+        username = rb_name
 
         if is_banned(username):
             self.send_error_msg("You are banned from NA Chat")
@@ -318,13 +372,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             except Exception:
                 pass
 
-        # authoritative admin check, server-side only
-        is_admin = False
-        try:
-            if isinstance(user_id, int) and user_id in ADMIN_IDS:
-                is_admin = True
-        except Exception:
-            is_admin = False
+        auth = data.get("auth")
+        is_admin = is_admin_auth(user_id, auth)
 
         self.username = username
         self.add_user(
@@ -336,11 +385,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             place_id=place_id,
             job_id=job_id,
             activity_hidden=activity_hidden,
+            display_name=rb_dname or "",
         )
 
         self.send({
             "type": "registered",
             "username": username,
+            "displayName": rb_dname or "",
             "token": "dummy_token",
             "hidden": hidden,
             "userId": user_id,
@@ -350,16 +401,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "jobId": job_id,
         })
 
-        # if not hidden:
-        #     broadcast(
-        #         {"type": "system", "message": f"{username} joined the chat"},
-        #         exclude=username,
-        #     )
-
         self.send({"type": "user_list", "users": get_user_list()})
 
         if is_admin:
             self.send({"type": "user_list_admin", "users": get_user_list_admin()})
+            self.send({"type": "admin_state", "banned": get_ban_list(), "muted": get_mute_list()})
 
     def handle_chat(self, data):
         if not self.username:
@@ -371,9 +417,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_banned(self.username):
             self.send_error_msg("You are banned from NA Chat")
             return
+
         mute_info = get_mute_info(self.username)
         if mute_info:
-            remaining = int(max(0, mute_info["until"] - time.time()))
+            remaining = int(max(0, mute_info["until"] - _now()))
             msg = f"You are muted in NA Chat ({remaining}s left)"
             if mute_info["reason"]:
                 msg += f" - {mute_info['reason']}"
@@ -388,16 +435,16 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Message too long")
             return
 
-        print("chat from", self.username, ":", msg)
-
         info = user_data.get(self.username, {})
         user_id = info.get("user_id")
         is_admin = bool(info.get("admin", False))
         game_status = info.get("game_status") or ""
+        dname = info.get("display_name") or ""
 
         broadcast({
             "type": "chat",
             "username": self.username,
+            "displayName": dname,
             "message": msg,
             "userId": user_id,
             "admin": is_admin,
@@ -409,7 +456,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         d = user_data.get(self.username)
         if d:
-            d["last_seen"] = time.time()
+            d["last_seen"] = _now()
         self.send({"type": "heartbeat_ack"})
 
     def handle_get_users(self):
@@ -419,7 +466,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if user_data.get(self.username, {}).get("hidden"):
             self.send_error_msg("Hidden users cannot view user list")
             return
-
         self.send({"type": "user_list", "users": get_user_list()})
 
     def handle_get_users_admin(self):
@@ -451,15 +497,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         user_data[self.username]["hidden"] = new_hidden
         self.send({"type": "hidden_updated", "hidden": new_hidden})
 
-        # if new_hidden:
-        #     broadcast({"type": "system", "message": f"{self.username} left the chat"})
-        # else:
-        #     broadcast(
-        #         {"type": "system", "message": f"{self.username} joined the chat"},
-        #         exclude=self.username,
-        #     )
-        #     self.send({"type": "user_list", "users": get_user_list()})
-
     def handle_typing(self, data):
         if not self.username:
             self.send_error_msg("Not registered")
@@ -490,9 +527,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_banned(self.username):
             self.send_error_msg("You are banned from NA Chat")
             return
+
         mute_info = get_mute_info(self.username)
         if mute_info:
-            remaining = int(max(0, mute_info["until"] - time.time()))
+            remaining = int(max(0, mute_info["until"] - _now()))
             msg = f"You are muted in NA Chat ({remaining}s left)"
             if mute_info["reason"]:
                 msg += f" - {mute_info['reason']}"
@@ -562,7 +600,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Invalid target")
             return
 
-        payload["timestamp"] = time.time()
+        payload["timestamp"] = _now()
         msg = json.dumps(payload)
 
         for name, ws in list(connections.items()):
@@ -585,7 +623,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return False
 
         payload = dict(payload)
-        payload["timestamp"] = time.time()
+        payload["timestamp"] = _now()
         msg = json.dumps(payload)
 
         sent_any = False
@@ -622,13 +660,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Message too long")
             return
 
-        broadcast(
-            {
-                "type": "announcement",
-                "from": self.username,
-                "message": message,
-            }
-        )
+        broadcast({"type": "announcement", "from": self.username, "message": message})
 
     def handle_notify(self, data):
         if not self.username:
@@ -659,12 +691,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             duration = 30.0
 
         target = data.get("target")
-        payload = {
-            "type": "notify",
-            "from": self.username,
-            "message": message,
-            "duration": duration,
-        }
+        payload = {"type": "notify", "from": self.username, "message": message, "duration": duration}
         self._send_targeted_by_user_id(payload, target)
 
     def handle_notify2(self, data):
@@ -686,11 +713,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
 
         target = data.get("target")
-        payload = {
-            "type": "notify2",
-            "from": self.username,
-            "message": message,
-        }
+        payload = {"type": "notify2", "from": self.username, "message": message}
         self._send_targeted_by_user_id(payload, target)
 
     def handle_notify3(self, data):
@@ -712,11 +735,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
 
         target = data.get("target")
-        payload = {
-            "type": "notify3",
-            "from": self.username,
-            "message": message,
-        }
+        payload = {"type": "notify3", "from": self.username, "message": message}
         self._send_targeted_by_user_id(payload, target)
 
     def handle_admin_action(self, data):
@@ -754,12 +773,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     ws.close(4000, "Kicked from NA Chat")
                 except Exception:
                     pass
-                broadcast(
-                    {
-                        "type": "system",
-                        "message": f"{target} was kicked from NA Chat",
-                    }
-                )
+                broadcast({"type": "system", "message": f"{target} was kicked from NA Chat"})
 
         elif action == "ban":
             ban_user(target)
@@ -769,12 +783,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     ws.close(4001, "Banned from NA Chat")
                 except Exception:
                     pass
-            broadcast(
-                {
-                    "type": "system",
-                    "message": f"{target} was banned from NA Chat",
-                }
-            )
+            broadcast({"type": "system", "message": f"{target} was banned from NA Chat"})
 
         elif action == "unban":
             unban_user(target)
@@ -786,21 +795,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             reason = (data.get("reason") or "").strip()
             mute_user(target, duration, reason=reason)
             reason_suffix = f" - {reason}" if reason else ""
-            broadcast(
-                {
-                    "type": "system",
-                    "message": f"{target} was muted in NA Chat ({int(duration)}s){reason_suffix}",
-                }
-            )
+            broadcast({"type": "system", "message": f"{target} was muted in NA Chat ({int(duration)}s){reason_suffix}"})
 
         elif action == "unmute":
             unmute_user(target)
-            broadcast(
-                {
-                    "type": "system",
-                    "message": f"{target} was unmuted in NA Chat",
-                }
-            )
+            broadcast({"type": "system", "message": f"{target} was unmuted from NA Chat"})
 
         elif action == "refresh":
             pass
@@ -808,18 +807,32 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Unknown admin action")
             return
 
-        self.send(
-            {
-                "type": "admin_state",
-                "banned": get_ban_list(),
-                "muted": get_mute_list(),
-            }
-        )
+        self.send({"type": "admin_state", "banned": get_ban_list(), "muted": get_mute_list()})
 
 
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
         self.write("OK")
+
+
+def cleanup_inactive_users():
+    timeout = CONFIG["heartbeat_timeout"]
+    now = _now()
+    to_remove = []
+
+    for name, data in list(user_data.items()):
+        last_seen = data.get("last_seen", now)
+        if now - last_seen > timeout:
+            to_remove.append(name)
+
+    for name in to_remove:
+        ws = connections.pop(name, None)
+        user_data.pop(name, None)
+        if ws:
+            try:
+                ws.close(1000, "Inactive timeout")
+            except Exception:
+                pass
 
 
 def make_app():
@@ -829,33 +842,6 @@ def make_app():
             (r"/healthz", HealthHandler),
         ]
     )
-
-
-def cleanup_inactive_users():
-    timeout = CONFIG["heartbeat_timeout"]
-    now = time.time()
-    to_remove = []
-
-    for name, data in list(user_data.items()):
-        last_seen = data.get("last_seen", now)
-        if now - last_seen > timeout:
-            to_remove.append(name)
-
-    for name in to_remove:
-        print("Removing inactive user", name)
-        ws = connections.pop(name, None)
-        user_data.pop(name, None)
-
-        if ws:
-            try:
-                ws.close(1000, "Inactive timeout")
-            except Exception:
-                pass
-
-        # broadcast({
-        #     "type": "system",
-        #     "message": f"{name} left (timeout)"
-        # })
 
 
 if __name__ == "__main__":

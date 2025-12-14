@@ -757,7 +757,7 @@ class HealthHandler(tornado.web.RequestHandler):
 def make_app():
     return tornado.web.Application(
         [
-            (r"/swimhub", IntegrationHandler),
+            (r"/swimhub/?", IntegrationHandler),
             (r"/healthz", HealthHandler),
         ]
     )

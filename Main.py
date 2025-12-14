@@ -101,6 +101,10 @@ def get_user_list():
     return result
 
 
+
+
+
+
 def get_user_list_admin():
     result = []
     for u, d in user_data.items():
@@ -118,10 +122,18 @@ def get_user_list_admin():
     return result
 
 
+
+
+
+
 def is_banned(username: str) -> bool:
     if not username:
         return False
     return username.lower() in banned_users
+
+
+
+
 
 
 def ban_user(username: str):
@@ -129,13 +141,25 @@ def ban_user(username: str):
         banned_users.add(username.lower())
 
 
+
+
+
+
 def unban_user(username: str):
     if username:
         banned_users.discard(username.lower())
 
 
+
+
+
+
 def get_ban_list():
     return sorted(banned_users)
+
+
+
+
 
 
 def get_mute_info(username: str):
@@ -163,6 +187,12 @@ def get_mute_info(username: str):
     return {"until": until_val, "reason": str(reason)}
 
 
+
+
+
+
+
+
 def mute_user(username: str, duration_seconds: float, reason: str = ""):
     if not username:
         return
@@ -176,9 +206,18 @@ def mute_user(username: str, duration_seconds: float, reason: str = ""):
     muted_until[username.lower()] = {"until": time.time() + duration, "reason": (reason or "")[:200]}
 
 
+
+
+
+
+
 def unmute_user(username: str):
     if username:
         muted_until.pop(username.lower(), None)
+
+
+
+
 
 
 def get_mute_list():
@@ -194,6 +233,10 @@ def get_mute_list():
     return out
 
 
+
+
+
+
 def broadcast(obj, exclude=None):
     obj["timestamp"] = time.time()
     msg = json.dumps(obj)
@@ -204,6 +247,9 @@ def broadcast(obj, exclude=None):
             ws.write_message(msg)
         except Exception:
             pass
+
+
+
 
 
 def send_to_user(username, obj):
@@ -219,14 +265,19 @@ def send_to_user(username, obj):
         return False
 
 
+
+
+
 class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
         return True
+
 
     def open(self):
         self.username = None
         self.ip = self.request.remote_ip
         print("new connection from", self.ip)
+
 
     def on_message(self, message):
         try:
@@ -234,6 +285,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         except Exception:
             self.send_error_msg("Invalid JSON")
             return
+
 
         t = data.get("type")
 
@@ -268,10 +320,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         else:
             self.send_error_msg("Unknown type: " + str(t))
 
+
     def on_close(self):
         if self.username:
             print(self.username, "disconnected")
             self.remove_user()
+
 
     def send(self, obj):
         obj["timestamp"] = time.time()
@@ -280,12 +334,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         except Exception:
             pass
 
+
     def send_error_msg(self, msg, code=None, **extra):
         payload = {"type": "error", "message": msg}
         if code:
             payload["code"] = code
         payload.update(extra or {})
         self.send(payload)
+
 
     def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name=""):
         connections[username] = self
@@ -301,6 +357,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "display_name": display_name or "",
         }
 
+
     def remove_user(self):
         u = self.username
         if not u:
@@ -309,6 +366,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         user_data.pop(u, None)
 
     def handle_register(self, data):
+        if data.get("is_server") is not True:
+            self.send_error_msg("Client outdated / not allowed", code="client_blocked")
+            try:
+                self.close(4004, "Client blocked")
+            except Exception:
+                pass
+            return
+
+
         hidden = bool(data.get("hidden", False))
         user_id = coerce_user_id(data.get("userId"))
         activity_hidden = bool(data.get("activityHidden", False) or data.get("activity_hidden", False))

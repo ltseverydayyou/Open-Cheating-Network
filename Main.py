@@ -785,7 +785,7 @@ def cleanup_inactive_users():
 if __name__ == "__main__":
     app = make_app()
     port = int(os.environ.get("PORT", "8000"))
-    app.listen(port)
+    app.listen(port, address="0.0.0.0")
     tornado.ioloop.PeriodicCallback(cleanup_inactive_users, 10000).start()
     print("=" * 50)
     print(f"Server started on port {port} ..")

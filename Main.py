@@ -226,7 +226,7 @@ def get_mute_list():
 
 def broadcast(obj, exclude=None):
     obj["timestamp"] = time.time()
-    msg = json.dumps(obj, ensure_ascii=False)
+    msg = json.dumps(obj, ensure_ascii=False) + "\n"
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
             continue
@@ -243,10 +243,33 @@ def send_to_user(username, obj):
     obj = dict(obj)
     obj["timestamp"] = time.time()
     try:
-        ws.write_message(json.dumps(obj, ensure_ascii=False))
+        ws.write_message(json.dumps(obj, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False
+
+
+def push_presence():
+    users = get_user_list()
+    admins = get_user_list_admin()
+    now = time.time()
+
+    for name, ws in list(connections.items()):
+        info = user_data.get(name) or {}
+
+        if info.get("hidden"):
+            continue
+
+        try:
+            ws.write_message(json.dumps({"type": "user_list", "users": users, "timestamp": now}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+        if info.get("admin"):
+            try:
+                ws.write_message(json.dumps({"type": "user_list_admin", "users": admins, "timestamp": now}, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
 
 class IntegrationHandler(tornado.websocket.WebSocketHandler):
@@ -322,13 +345,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     chunk["chunkTotal"] = chunks
                     chunk["timestamp"] = time.time()
                     try:
-                        self.write_message(json.dumps(chunk, ensure_ascii=False))
+                        self.write_message(json.dumps(chunk, ensure_ascii=False) + "\n")
                     except Exception:
                         pass
                 return
         obj["timestamp"] = time.time()
         try:
-            self.write_message(json.dumps(obj, ensure_ascii=False))
+            self.write_message(json.dumps(obj, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -359,6 +382,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         connections.pop(u, None)
         user_data.pop(u, None)
+        push_presence()
 
     def handle_register(self, data):
         if data.get("is_server") is not True:
@@ -431,6 +455,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             activity_hidden=activity_hidden,
             display_name=display_name,
         )
+        push_presence()
 
         self.send({
             "type": "registered",
@@ -526,6 +551,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if new_hidden == old_hidden:
             return
         user_data[self.username]["hidden"] = new_hidden
+        push_presence()
         self.send({"type": "hidden_updated", "hidden": new_hidden})
 
     def handle_typing(self, data):
@@ -610,7 +636,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Invalid target")
             return
         payload["timestamp"] = time.time()
-        msg = json.dumps(payload, ensure_ascii=False)
+        msg = json.dumps(payload, ensure_ascii=False) + "\n"
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
@@ -630,7 +656,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return False
         payload = dict(payload)
         payload["timestamp"] = time.time()
-        msg = json.dumps(payload, ensure_ascii=False)
+        msg = json.dumps(payload, ensure_ascii=False) + "\n"
         sent_any = False
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
@@ -810,6 +836,7 @@ def cleanup_inactive_users():
         last_seen = data.get("last_seen", now)
         if now - last_seen > timeout:
             to_remove.append(name)
+
     for name in to_remove:
         print("Removing inactive user", name)
         ws = connections.pop(name, None)
@@ -820,6 +847,8 @@ def cleanup_inactive_users():
             except Exception:
                 pass
 
+    if to_remove:
+        push_presence()
 
 if __name__ == "__main__":
     app = make_app()

@@ -276,7 +276,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def send(self, obj):
         obj["timestamp"] = time.time()
         try:
-            self.write_message(json.dumps(obj))
+            self.write_message(json.dumps(obj, ensure_ascii=False))
         except Exception:
             pass
 
@@ -560,7 +560,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Invalid target")
             return
         payload["timestamp"] = time.time()
-        msg = json.dumps(payload)
+        msg = json.dumps(payload, ensure_ascii=False)
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
@@ -580,7 +580,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return False
         payload = dict(payload)
         payload["timestamp"] = time.time()
-        msg = json.dumps(payload)
+        msg = json.dumps(payload, ensure_ascii=False)
         sent_any = False
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})

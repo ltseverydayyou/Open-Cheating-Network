@@ -35,6 +35,24 @@ muted_until = {}
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
 
+def sanitize_text(s, max_len=None):
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    cleaned_chars = []
+    for ch in s:
+        code = ord(ch)
+        if 0xD800 <= code <= 0xDFFF:
+            continue
+        if code > 0xFFFF:
+            continue
+        cleaned_chars.append(ch)
+    cleaned = "".join(cleaned_chars)
+    if max_len is not None and len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
 ADMIN_SECRET = os.environ.get("ADMIN_KEY", "").strip()
 
 
@@ -67,15 +85,15 @@ def fetch_roblox_user(user_id: int):
         with urllib.request.urlopen(url, timeout=4.0) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
         data = json.loads(raw)
-        name = data.get("name")
-        display = data.get("displayName")
-        if isinstance(name, str) and name:
+        name = sanitize_text(data.get("name") or "", CONFIG["max_username_length"])
+        display = sanitize_text(data.get("displayName") or "", CONFIG["max_username_length"])
+        if name:
             ROBLOX_USER_CACHE[user_id] = {
                 "ts": now,
                 "name": name,
-                "displayName": (display if isinstance(display, str) else ""),
+                "displayName": display,
             }
-            return name, (display if isinstance(display, str) else "")
+            return name, display
     except Exception:
         pass
 
@@ -88,10 +106,12 @@ def get_user_list():
         if d.get("hidden", False):
             continue
         activity_hidden = bool(d.get("activity_hidden", False))
-        game_status = d.get("game_status") or ""
+        username = sanitize_text(u, CONFIG["max_username_length"])
+        display_name = sanitize_text(d.get("display_name") or "", CONFIG["max_username_length"])
+        game_status = sanitize_text(d.get("game_status") or "", CONFIG["max_game_name_length"])
         result.append({
-            "username": u,
-            "displayName": d.get("display_name") or "",
+            "username": username,
+            "displayName": display_name,
             "userId": d.get("user_id"),
             "admin": bool(d.get("admin", False)),
             "game": "Game: Hidden" if activity_hidden else game_status,
@@ -104,14 +124,17 @@ def get_user_list():
 def get_user_list_admin():
     result = []
     for u, d in user_data.items():
+        username = sanitize_text(u, CONFIG["max_username_length"])
+        display_name = sanitize_text(d.get("display_name") or "", CONFIG["max_username_length"])
+        game_status = sanitize_text(d.get("game_status") or "", CONFIG["max_game_name_length"])
         result.append({
-            "username": u,
-            "displayName": d.get("display_name") or "",
+            "username": username,
+            "displayName": display_name,
             "userId": d.get("user_id"),
             "admin": bool(d.get("admin", False)),
             "hidden": bool(d.get("hidden", False)),
             "activityHidden": bool(d.get("activity_hidden", False)),
-            "game": d.get("game_status") or "",
+            "game": game_status,
             "placeId": d.get("place_id"),
             "jobId": d.get("job_id"),
         })
@@ -173,7 +196,10 @@ def mute_user(username: str, duration_seconds: float, reason: str = ""):
     if duration <= 0:
         unmute_user(username)
         return
-    muted_until[username.lower()] = {"until": time.time() + duration, "reason": (reason or "")[:200]}
+    muted_until[username.lower()] = {
+        "until": time.time() + duration,
+        "reason": sanitize_text(reason or "", 200),
+    }
 
 
 def unmute_user(username: str):
@@ -188,7 +214,11 @@ def get_mute_list():
         until = entry.get("until") if isinstance(entry, dict) else entry
         reason = entry.get("reason") if isinstance(entry, dict) else ""
         if until and until > now:
-            out.append({"username": name, "until": until, "reason": reason or ""})
+            out.append({
+                "username": name,
+                "until": until,
+                "reason": sanitize_text(reason or "", 200),
+            })
         else:
             muted_until.pop(name, None)
     return out
@@ -326,6 +356,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
+        raw_game = sanitize_text(raw_game, CONFIG["max_game_name_length"])
 
         if not user_id or user_id <= 0:
             self.send_error_msg("Missing/invalid userId")
@@ -415,12 +446,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg(msg, code="muted", until=mute_info["until"], reason=mute_info["reason"])
             return
 
-        msg = (data.get("message") or "").strip()
+        msg = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not msg:
-            self.send_error_msg("Message cannot be empty")
-            return
-        if len(msg) > CONFIG["max_message_length"]:
-            self.send_error_msg("Message too long")
+            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
             return
 
         info = user_data.get(self.username, {})
@@ -510,7 +538,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg(msg, code="muted", until=mute_info["until"], reason=mute_info["reason"])
             return
 
-        message = (data.get("message") or "").strip()
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         target = (data.get("target") or "").strip()
 
         if not message:
@@ -603,12 +631,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not info.get("admin"):
             self.send_error_msg("Not authorized")
             return
-        message = (data.get("message") or "").strip()
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty")
-            return
-        if len(message) > CONFIG["max_message_length"]:
-            self.send_error_msg("Message too long")
+            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
             return
         broadcast({"type": "announcement", "from": self.username, "message": message})
 
@@ -620,12 +645,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not info.get("admin"):
             self.send_error_msg("Not authorized")
             return
-        message = (data.get("message") or "").strip()
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty")
-            return
-        if len(message) > CONFIG["max_message_length"]:
-            self.send_error_msg("Message too long")
+            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
             return
         duration = data.get("duration")
         try:
@@ -648,12 +670,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not info.get("admin"):
             self.send_error_msg("Not authorized")
             return
-        message = (data.get("message") or "").strip()
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty")
-            return
-        if len(message) > CONFIG["max_message_length"]:
-            self.send_error_msg("Message too long")
+            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
             return
         target = data.get("target")
         payload = {"type": "notify2", "from": self.username, "message": message}
@@ -667,12 +686,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not info.get("admin"):
             self.send_error_msg("Not authorized")
             return
-        message = (data.get("message") or "").strip()
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty")
-            return
-        if len(message) > CONFIG["max_message_length"]:
-            self.send_error_msg("Message too long")
+            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
             return
         target = data.get("target")
         payload = {"type": "notify3", "from": self.username, "message": message}
@@ -731,7 +747,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         elif action == "mute":
             if not duration:
                 duration = 300
-            reason = (data.get("reason") or "").strip()
+            raw_reason = (data.get("reason") or "").strip()
+            reason = sanitize_text(raw_reason, 200)
             mute_user(target, duration, reason=reason)
             reason_suffix = f" - {reason}" if reason else ""
             broadcast({"type": "system", "message": f"{target} was muted in NA Chat ({int(duration)}s){reason_suffix}"})

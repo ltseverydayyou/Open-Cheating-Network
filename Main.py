@@ -35,9 +35,6 @@ muted_until = {}
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
 
-ADMIN_SECRET = os.environ.get("ADMIN_KEY", "").strip()
-
-
 def sanitize_text(s, max_len=None):
     if s is None:
         return ""
@@ -48,14 +45,13 @@ def sanitize_text(s, max_len=None):
         code = ord(ch)
         if 0xD800 <= code <= 0xDFFF:
             continue
-        if code > 0xFFFF:
-            continue
         cleaned_chars.append(ch)
     cleaned = "".join(cleaned_chars)
     if max_len is not None and len(cleaned) > max_len:
         cleaned = cleaned[:max_len]
     return cleaned
 
+ADMIN_SECRET = os.environ.get("ADMIN_KEY", "").strip()
 
 def coerce_user_id(v):
     if v is None:
@@ -73,7 +69,6 @@ def coerce_user_id(v):
         if s.isdigit():
             return int(s)
     return None
-
 
 def fetch_roblox_user(user_id: int):
     now = time.time()
@@ -95,7 +90,6 @@ def fetch_roblox_user(user_id: int):
         pass
 
     return None, None
-
 
 def get_user_list():
     result = []
@@ -119,7 +113,6 @@ def get_user_list():
         )
     return result
 
-
 def get_user_list_admin():
     result = []
     for u, d in user_data.items():
@@ -141,26 +134,21 @@ def get_user_list_admin():
         )
     return result
 
-
 def is_banned(username: str) -> bool:
     if not username:
         return False
     return username.lower() in banned_users
 
-
 def ban_user(username: str):
     if username:
         banned_users.add(username.lower())
-
 
 def unban_user(username: str):
     if username:
         banned_users.discard(username.lower())
 
-
 def get_ban_list():
     return sorted(banned_users)
-
 
 def get_mute_info(username: str):
     if not username:
@@ -186,7 +174,6 @@ def get_mute_info(username: str):
         return None
     return {"until": until_val, "reason": str(reason)}
 
-
 def mute_user(username: str, duration_seconds: float, reason: str = ""):
     if not username:
         return
@@ -197,16 +184,11 @@ def mute_user(username: str, duration_seconds: float, reason: str = ""):
     if duration <= 0:
         unmute_user(username)
         return
-    muted_until[username.lower()] = {
-        "until": time.time() + duration,
-        "reason": sanitize_text(reason or "", 200),
-    }
-
+    muted_until[username.lower()] = {"until": time.time() + duration, "reason": sanitize_text(reason or "", 200)}
 
 def unmute_user(username: str):
     if username:
         muted_until.pop(username.lower(), None)
-
 
 def get_mute_list():
     now = time.time()
@@ -215,87 +197,54 @@ def get_mute_list():
         until = entry.get("until") if isinstance(entry, dict) else entry
         reason = entry.get("reason") if isinstance(entry, dict) else ""
         if until and until > now:
-            out.append(
-                {
-                    "username": name,
-                    "until": until,
-                    "reason": sanitize_text(reason or "", 200),
-                }
-            )
+            out.append({"username": name, "until": until, "reason": sanitize_text(reason or "", 200)})
         else:
             muted_until.pop(name, None)
     return out
 
-
 def broadcast(obj, exclude=None):
-    obj = dict(obj or {})
     obj["timestamp"] = time.time()
     msg = json.dumps(obj, ensure_ascii=False) + "\n"
-
-    dead = []
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
             continue
         try:
             ws.write_message(msg)
         except Exception:
-            dead.append(name)
-
-    if dead:
-        for name in dead:
-            connections.pop(name, None)
-            user_data.pop(name, None)
-        push_presence()
-
+            pass
 
 def send_to_user(username, obj):
     ws = connections.get(username)
     if not ws:
         return False
-    payload = dict(obj or {})
-    payload["timestamp"] = time.time()
+    obj = dict(obj)
+    obj["timestamp"] = time.time()
     try:
-        ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
+        ws.write_message(json.dumps(obj, ensure_ascii=False) + "\n")
         return True
     except Exception:
-        connections.pop(username, None)
-        user_data.pop(username, None)
-        push_presence()
         return False
-
 
 def push_presence():
     users = get_user_list()
     admins = get_user_list_admin()
     now = time.time()
 
-    dead = []
     for name, ws in list(connections.items()):
         info = user_data.get(name) or {}
         if info.get("hidden"):
             continue
 
         try:
-            ws.write_message(
-                json.dumps({"type": "user_list", "users": users, "timestamp": now}, ensure_ascii=False) + "\n"
-            )
+            ws.write_message(json.dumps({"type": "user_list", "users": users, "timestamp": now}, ensure_ascii=False) + "\n")
         except Exception:
-            dead.append(name)
-            continue
+            pass
 
         if info.get("admin"):
             try:
-                ws.write_message(
-                    json.dumps({"type": "user_list_admin", "users": admins, "timestamp": now}, ensure_ascii=False) + "\n"
-                )
+                ws.write_message(json.dumps({"type": "user_list_admin", "users": admins, "timestamp": now}, ensure_ascii=False) + "\n")
             except Exception:
-                dead.append(name)
-
-    if dead:
-        for name in set(dead):
-            connections.pop(name, None)
-            user_data.pop(name, None)
-
+                pass
 
 class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
@@ -304,6 +253,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def open(self):
         self.username = None
         self.ip = self.request.remote_ip
+        print("new connection from", self.ip)
 
     def on_message(self, message):
         try:
@@ -347,11 +297,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
     def on_close(self):
         if self.username:
+            print(self.username, "disconnected")
             self.remove_user()
 
     def send(self, obj):
-        obj = dict(obj or {})
-        t = obj.get("type")
+        t = obj.get("type") if isinstance(obj, dict) else None
         if t in ("user_list", "user_list_admin"):
             users = obj.get("users") or []
             try:
@@ -373,7 +323,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     except Exception:
                         pass
                 return
-
         obj["timestamp"] = time.time()
         try:
             self.write_message(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -387,21 +336,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(
-        self,
-        username,
-        hidden,
-        user_id=None,
-        is_admin=False,
-        game_status=None,
-        place_id=None,
-        job_id=None,
-        activity_hidden=False,
-        display_name="",
-    ):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name=""):
         connections[username] = self
         user_data[username] = {
-            "hidden": bool(hidden),
+            "hidden": hidden,
             "last_seen": time.time(),
             "user_id": user_id,
             "admin": bool(is_admin),
@@ -522,7 +460,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_banned(self.username):
             self.send_error_msg("You are banned from NA Chat")
             return
-
         mute_info = get_mute_info(self.username)
         if mute_info:
             remaining = int(max(0, mute_info["until"] - time.time()))
@@ -534,21 +471,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         msg = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not msg:
-            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
+            self.send_error_msg("Message cannot be empty")
             return
 
         info = user_data.get(self.username, {})
-        payload = {
-            "type": "chat",
-            "username": self.username,
-            "message": msg,
-            "userId": info.get("user_id"),
-            "admin": bool(info.get("admin", False)),
-            "game": info.get("game_status") or "",
-        }
+        user_id = info.get("user_id")
+        is_admin = bool(info.get("admin", False))
+        game_status = info.get("game_status") or ""
 
-        broadcast(payload, exclude=self.username)
-        self.send(payload)
+        broadcast({"type": "chat", "username": self.username, "message": msg, "userId": user_id, "admin": is_admin, "game": game_status})
 
     def handle_heartbeat(self):
         if not self.username:
@@ -585,7 +516,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Not registered")
             return
         new_hidden = bool(data.get("hidden", False))
-        old_hidden = bool(user_data.get(self.username, {}).get("hidden", False))
+        old_hidden = user_data.get(self.username, {}).get("hidden", False)
         if new_hidden == old_hidden:
             return
         user_data[self.username]["hidden"] = new_hidden
@@ -600,10 +531,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         is_typing = bool(data.get("is_typing", False))
         scope = data.get("scope") or "global"
-        broadcast(
-            {"type": "typing", "username": self.username, "is_typing": is_typing, "scope": scope},
-            exclude=self.username,
-        )
+        broadcast({"type": "typing", "username": self.username, "is_typing": is_typing, "scope": scope}, exclude=self.username)
 
     def handle_private_chat(self, data):
         if not self.username:
@@ -615,7 +543,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_banned(self.username):
             self.send_error_msg("You are banned from NA Chat")
             return
-
         mute_info = get_mute_info(self.username)
         if mute_info:
             remaining = int(max(0, mute_info["until"] - time.time()))
@@ -626,10 +553,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
 
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
-        target = sanitize_text((data.get("target") or "").strip(), CONFIG["max_username_length"])
+        target = (data.get("target") or "").strip()
 
         if not message:
             self.send_error_msg("Message cannot be empty")
+            return
+        if len(message) > CONFIG["max_message_length"]:
+            self.send_error_msg("Message too long")
             return
         if not target:
             self.send_error_msg("Target is required for private message")
@@ -655,17 +585,25 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not isinstance(args, list) or not args:
             self.send_error_msg("Invalid args")
             return
-
         target = data.get("target")
-        payload = {
-            "type": "remote_cmd",
-            "fromUserId": info.get("user_id"),
-            "fromUsername": self.username,
-            "args": args,
-            "target": target,
-        }
-
-        self._send_targeted_by_user_id(payload, target)
+        payload = {"type": "remote_cmd", "fromUserId": info.get("user_id"), "fromUsername": self.username, "args": args, "target": target}
+        if target is None or target == "" or target == "all":
+            broadcast(payload)
+            return
+        try:
+            target_id = int(target)
+        except (TypeError, ValueError):
+            self.send_error_msg("Invalid target")
+            return
+        payload["timestamp"] = time.time()
+        msg = json.dumps(payload, ensure_ascii=False) + "\n"
+        for name, ws in list(connections.items()):
+            uinfo = user_data.get(name, {})
+            if uinfo.get("user_id") == target_id:
+                try:
+                    ws.write_message(msg)
+                except Exception:
+                    pass
 
     def _send_targeted_by_user_id(self, payload, target):
         if target is None or target == "" or target == "all":
@@ -676,13 +614,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         except (TypeError, ValueError):
             self.send_error_msg("Invalid target")
             return False
-
         payload = dict(payload)
         payload["timestamp"] = time.time()
         msg = json.dumps(payload, ensure_ascii=False) + "\n"
-
         sent_any = False
-        dead = []
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
@@ -690,14 +625,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     ws.write_message(msg)
                     sent_any = True
                 except Exception:
-                    dead.append(name)
-
-        if dead:
-            for name in dead:
-                connections.pop(name, None)
-                user_data.pop(name, None)
-            push_presence()
-
+                    pass
         if not sent_any:
             self.send_error_msg("Target not online")
             return False
@@ -713,7 +641,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
+            self.send_error_msg("Message cannot be empty")
             return
         broadcast({"type": "announcement", "from": self.username, "message": message})
 
@@ -727,16 +655,17 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
+            self.send_error_msg("Message cannot be empty")
             return
-
         duration = data.get("duration")
         try:
             duration = float(duration)
         except Exception:
             duration = 5.0
-        duration = max(1.0, min(30.0, duration))
-
+        if duration < 1:
+            duration = 1.0
+        if duration > 30:
+            duration = 30.0
         target = data.get("target")
         payload = {"type": "notify", "from": self.username, "message": message, "duration": duration}
         self._send_targeted_by_user_id(payload, target)
@@ -751,7 +680,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
+            self.send_error_msg("Message cannot be empty")
             return
         target = data.get("target")
         payload = {"type": "notify2", "from": self.username, "message": message}
@@ -767,7 +696,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
-            self.send_error_msg("Message cannot be empty or only contains unsupported characters")
+            self.send_error_msg("Message cannot be empty")
             return
         target = data.get("target")
         payload = {"type": "notify3", "from": self.username, "message": message}
@@ -783,7 +712,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
 
         action = (data.get("action") or "").strip().lower()
-        target = sanitize_text((data.get("target") or "").strip(), CONFIG["max_username_length"])
+        target = (data.get("target") or "").strip()
         duration = data.get("duration", 0)
 
         if not action:
@@ -826,12 +755,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         elif action == "mute":
             if not duration:
                 duration = 300
-            try:
-                duration = float(duration)
-            except Exception:
-                duration = 300
-            if duration <= 0:
-                duration = 300
             raw_reason = (data.get("reason") or "").strip()
             reason = sanitize_text(raw_reason, 200)
             mute_user(target, duration, reason=reason)
@@ -850,31 +773,24 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         self.send({"type": "admin_state", "banned": get_ban_list(), "muted": get_mute_list()})
 
-
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
         self.write("OK")
 
-
 def make_app():
     return tornado.web.Application([(r"/swimhub/?", IntegrationHandler), (r"/healthz", HealthHandler)])
-
 
 def cleanup_inactive_users():
     timeout = CONFIG["heartbeat_timeout"]
     now = time.time()
     to_remove = []
-
     for name, data in list(user_data.items()):
         last_seen = data.get("last_seen", now)
-        try:
-            last_seen = float(last_seen)
-        except Exception:
-            last_seen = now
         if now - last_seen > timeout:
             to_remove.append(name)
 
     for name in to_remove:
+        print("Removing inactive user", name)
         ws = connections.pop(name, None)
         user_data.pop(name, None)
         if ws:
@@ -886,10 +802,12 @@ def cleanup_inactive_users():
     if to_remove:
         push_presence()
 
-
 if __name__ == "__main__":
     app = make_app()
     port = int(os.environ.get("PORT", "8000"))
     app.listen(port, address="0.0.0.0")
     tornado.ioloop.PeriodicCallback(cleanup_inactive_users, 10000).start()
+    print("=" * 50)
+    print(f"Server started on port {port} ..")
+    print("=" * 50)
     tornado.ioloop.IOLoop.current().start()

@@ -304,6 +304,28 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.remove_user()
 
     def send(self, obj):
+        t = obj.get("type") if isinstance(obj, dict) else None
+        if t in ("user_list", "user_list_admin"):
+            users = obj.get("users") or []
+            try:
+                total = len(users)
+            except Exception:
+                total = 0
+            max_chunk = 50
+            if total > max_chunk:
+                chunks = (total + max_chunk - 1) // max_chunk
+                for i in range(0, total, max_chunk):
+                    chunk = dict(obj)
+                    chunk_users = users[i:i + max_chunk]
+                    chunk["users"] = chunk_users
+                    chunk["chunkIndex"] = i // max_chunk
+                    chunk["chunkTotal"] = chunks
+                    chunk["timestamp"] = time.time()
+                    try:
+                        self.write_message(json.dumps(chunk, ensure_ascii=True))
+                    except Exception:
+                        pass
+                return
         obj["timestamp"] = time.time()
         try:
             self.write_message(json.dumps(obj, ensure_ascii=True))

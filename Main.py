@@ -196,7 +196,7 @@ def get_mute_list():
 
 def broadcast(obj, exclude=None):
     obj["timestamp"] = time.time()
-    msg = json.dumps(obj)
+    msg = json.dumps(obj, ensure_ascii=False)
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
             continue
@@ -213,7 +213,7 @@ def send_to_user(username, obj):
     obj = dict(obj)
     obj["timestamp"] = time.time()
     try:
-        ws.write_message(json.dumps(obj))
+        ws.write_message(json.dumps(obj, ensure_ascii=False))
         return True
     except Exception:
         return False

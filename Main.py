@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import urllib.parse
 import urllib.request
 import tornado.ioloop
 import tornado.web
@@ -70,6 +71,22 @@ def coerce_user_id(v):
             return int(s)
     return None
 
+def roblox_api_urls(url: str):
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.netloc.lower()
+    subdomain = None
+    for suffix in (".roblox.com", ".roproxy.com", ".rotunnel.com"):
+        if host.endswith(suffix):
+            subdomain = parsed.netloc[: -len(suffix)]
+            break
+    if not subdomain:
+        return [url]
+    return [
+        urllib.parse.urlunsplit(parsed._replace(netloc=f"{subdomain}.roproxy.com")),
+        urllib.parse.urlunsplit(parsed._replace(netloc=f"{subdomain}.rotunnel.com")),
+        urllib.parse.urlunsplit(parsed._replace(netloc=f"{subdomain}.roblox.com")),
+    ]
+
 def fetch_roblox_user(user_id: int):
     now = time.time()
     cached = ROBLOX_USER_CACHE.get(user_id)
@@ -77,17 +94,18 @@ def fetch_roblox_user(user_id: int):
         return cached.get("name"), cached.get("displayName")
 
     url = f"https://users.roblox.com/v1/users/{int(user_id)}"
-    try:
-        with urllib.request.urlopen(url, timeout=4.0) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-        data = json.loads(raw)
-        name = sanitize_text(data.get("name") or "", CONFIG["max_username_length"])
-        display = sanitize_text(data.get("displayName") or "", CONFIG["max_username_length"])
-        if name:
-            ROBLOX_USER_CACHE[user_id] = {"ts": now, "name": name, "displayName": display}
-            return name, display
-    except Exception:
-        pass
+    for api_url in roblox_api_urls(url):
+        try:
+            with urllib.request.urlopen(api_url, timeout=4.0) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            name = sanitize_text(data.get("name") or "", CONFIG["max_username_length"])
+            display = sanitize_text(data.get("displayName") or "", CONFIG["max_username_length"])
+            if name:
+                ROBLOX_USER_CACHE[user_id] = {"ts": now, "name": name, "displayName": display}
+                return name, display
+        except Exception:
+            pass
 
     return None, None
 

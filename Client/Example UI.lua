@@ -739,7 +739,7 @@ integration_service.OnError.Event:Connect(function(error_message, timestamp)
 end)
 
 integration_service.Init({
-    serverUrl = "wss://witty-minette-adonis-632b17c0.koyeb.app/swimhub",
+    serverUrl = "wss://open-cheating-network.onrender.com/axxum",
     heartbeatInterval = 5,
     autoReconnect = true,
     hidden = false

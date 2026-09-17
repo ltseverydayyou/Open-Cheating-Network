@@ -3,6 +3,8 @@ import json
 import time
 import urllib.parse
 import urllib.request
+import uuid
+from collections import deque
 import tornado.ioloop
 import tornado.web
 import tornado.websocket
@@ -29,6 +31,7 @@ ADMIN_IDS = {
 
 connections = {}
 user_data = {}
+http_clients = {}
 
 banned_users = set()
 muted_until = {}
@@ -268,6 +271,16 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
         return True
 
+    async def get(self):
+        # A normal GET is used by clients to detect that the service is alive
+        # before choosing the HTTP polling fallback.
+        if self.request.headers.get("Upgrade", "").lower() != "websocket":
+            self.set_status(426)
+            self.set_header("Content-Type", "text/plain")
+            self.finish("WebSocket upgrade required; use the HTTP fallback endpoints.")
+            return
+        await super().get()
+
     def open(self):
         self.username = None
         self.ip = self.request.remote_ip
@@ -280,38 +293,13 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Invalid JSON")
             return
 
-        t = data.get("type")
+        dispatch_message(self, data)
 
-        if t == "register":
-            self.handle_register(data)
-        elif t == "chat":
-            self.handle_chat(data)
-        elif t == "heartbeat":
-            self.handle_heartbeat()
-        elif t == "get_users":
-            self.handle_get_users()
-        elif t == "get_users_admin":
-            self.handle_get_users_admin()
-        elif t == "set_hidden":
-            self.handle_set_hidden(data)
-        elif t == "remote_cmd":
-            self.handle_remote_cmd(data)
-        elif t == "typing":
-            self.handle_typing(data)
-        elif t == "private_chat":
-            self.handle_private_chat(data)
-        elif t == "announcement":
-            self.handle_announcement(data)
-        elif t == "notify":
-            self.handle_notify(data)
-        elif t == "notify2":
-            self.handle_notify2(data)
-        elif t == "notify3":
-            self.handle_notify3(data)
-        elif t == "admin_action":
-            self.handle_admin_action(data)
-        else:
-            self.send_error_msg("Unknown type: " + str(t))
+    def _dispatch_message(self, data):
+        dispatch_message(self, data)
+
+    def _close_client(self):
+        self.on_close()
 
     def on_close(self):
         if self.username:
@@ -791,12 +779,155 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         self.send({"type": "admin_state", "banned": get_ban_list(), "muted": get_mute_list()})
 
+
+def dispatch_message(client, data):
+    if not isinstance(data, dict):
+        client.send_error_msg("Invalid JSON")
+        return
+
+    t = data.get("type")
+    if t == "register":
+        client.handle_register(data)
+    elif t == "chat":
+        client.handle_chat(data)
+    elif t == "heartbeat":
+        client.handle_heartbeat()
+    elif t == "get_users":
+        client.handle_get_users()
+    elif t == "get_users_admin":
+        client.handle_get_users_admin()
+    elif t == "set_hidden":
+        client.handle_set_hidden(data)
+    elif t == "remote_cmd":
+        client.handle_remote_cmd(data)
+    elif t == "typing":
+        client.handle_typing(data)
+    elif t == "private_chat":
+        client.handle_private_chat(data)
+    elif t == "announcement":
+        client.handle_announcement(data)
+    elif t == "notify":
+        client.handle_notify(data)
+    elif t == "notify2":
+        client.handle_notify2(data)
+    elif t == "notify3":
+        client.handle_notify3(data)
+    elif t == "admin_action":
+        client.handle_admin_action(data)
+    else:
+        client.send_error_msg("Unknown type: " + str(t))
+
+
+class HttpClient(IntegrationHandler):
+    """A small adapter that gives HTTP polling clients the same interface as WebSockets."""
+
+    def __init__(self, client_id, ip):
+        self.client_id = client_id
+        self.ip = ip
+        self.username = None
+        self.closed = False
+        self.last_seen = time.time()
+        self.queue = deque()
+
+    def write_message(self, message, *args, **kwargs):
+        if not self.closed:
+            self.queue.append(message)
+
+    def close(self, code=None, reason=None):
+        if self.closed:
+            return
+        self.closed = True
+        http_clients.pop(self.client_id, None)
+        self.on_close()
+
+
+def decode_request_body(request):
+    try:
+        raw = request.body.decode("utf-8") if request.body else "{}"
+        data = json.loads(raw)
+    except Exception:
+        raise tornado.web.HTTPError(400, reason="Invalid JSON")
+    if not isinstance(data, dict):
+        raise tornado.web.HTTPError(400, reason="JSON object required")
+    return data
+
+
+class AxxumRegisterHandler(tornado.web.RequestHandler):
+    def post(self):
+        data = decode_request_body(self.request)
+        client_id = uuid.uuid4().hex
+        client = HttpClient(client_id, self.request.remote_ip)
+        http_clients[client_id] = client
+        dispatch_message(client, data)
+        client.last_seen = time.time()
+        self.set_header("Content-Type", "application/json")
+        self.write({"clientId": client_id})
+
+
+class AxxumPollHandler(tornado.web.RequestHandler):
+    def get(self):
+        client_id = self.get_query_argument("clientId", default="")
+        client = http_clients.get(client_id)
+        if not client or client.closed:
+            self.set_status(404)
+            self.finish("Unknown clientId")
+            return
+
+        client.last_seen = time.time()
+        messages = []
+        while client.queue:
+            raw = client.queue.popleft()
+            try:
+                messages.append(json.loads(raw))
+            except Exception:
+                continue
+
+        if not messages:
+            self.set_status(204)
+            self.finish()
+            return
+
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        self.write(json.dumps(messages, ensure_ascii=False))
+
+
+class AxxumSendHandler(tornado.web.RequestHandler):
+    def post(self):
+        client_id = self.get_query_argument("clientId", default="")
+        client = http_clients.get(client_id)
+        if not client or client.closed:
+            self.set_status(404)
+            self.finish("Unknown clientId")
+            return
+
+        data = decode_request_body(self.request)
+        client.last_seen = time.time()
+        dispatch_message(client, data)
+        self.write("OK")
+
+
+class AxxumDisconnectHandler(tornado.web.RequestHandler):
+    def post(self):
+        client_id = self.get_query_argument("clientId", default="")
+        client = http_clients.get(client_id)
+        if client:
+            client.close(1000, "Client disconnected")
+        self.write("OK")
+
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
         self.write("OK")
 
 def make_app():
-    return tornado.web.Application([(r"/swimhub/?", IntegrationHandler), (r"/healthz", HealthHandler)])
+    return tornado.web.Application([
+        (r"/axxum/?$", IntegrationHandler),
+        (r"/axxum/register$", AxxumRegisterHandler),
+        (r"/axxum/poll$", AxxumPollHandler),
+        (r"/axxum/send$", AxxumSendHandler),
+        (r"/axxum/disconnect$", AxxumDisconnectHandler),
+        (r"/healthz$", HealthHandler),
+    ])
 
 def cleanup_inactive_users():
     timeout = CONFIG["heartbeat_timeout"]
@@ -816,6 +947,10 @@ def cleanup_inactive_users():
                 ws.close(1000, "Inactive timeout")
             except Exception:
                 pass
+
+    for client_id, client in list(http_clients.items()):
+        if client.closed or now - client.last_seen > timeout:
+            client.close(1000, "Inactive timeout")
 
     if to_remove:
         push_presence()

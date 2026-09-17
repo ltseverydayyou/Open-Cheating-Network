@@ -36,7 +36,7 @@ end
 
 -- Init after everything is setup
 IntegrationService.Init({
-    serverUrl = "ws://localhost:8888/swimhub", -- ws for local host, wss for secure links
+    serverUrl = "ws://localhost:8888/axxum", -- ws for local host, wss for secure links
     heartbeatInterval = 5,
     autoReconnect = true,
     hidden = false

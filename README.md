@@ -48,8 +48,12 @@ python server.py
 ```
 
 Servers endpoints:
-- `/swimhub` - WebSocket endpoint for clients
-- `/chronos` - HTTP endpoint for server bridging
+- `/axxum` - WebSocket endpoint and HTTP transport probe
+- `/axxum/register` - HTTP fallback registration
+- `/axxum/poll` - HTTP fallback polling
+- `/axxum/send` - HTTP fallback client messages
+- `/axxum/disconnect` - HTTP fallback disconnect
+- `/healthz` - health check
 
 ## Client Setup (Lua)
 
@@ -58,7 +62,7 @@ Servers endpoints:
 local IntegrationService = loadstring(request({Url = "https://raw.githubusercontent.com/YellowFireFighter/Open-Cheating-Network/refs/heads/main/Client/Main.lua", Method = "Get"}).Body)()
 
 IntegrationService.Init({
-    serverUrl = "ws://your-server.com:8888/swimhub",
+    serverUrl = "ws://your-server.com:8888/axxum",
     heartbeatInterval = 5,
     autoReconnect = false,
     hidden = false

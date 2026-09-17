@@ -14,6 +14,9 @@ CONFIG = {
     "max_message_length": 500,
     "heartbeat_timeout": 90,
     "max_game_name_length": 80,
+    "max_group_name_length": 50,
+    "max_group_members": 50,
+    "max_groups_per_user": 20,
 }
 
 ADMIN_IDS = {
@@ -35,6 +38,7 @@ http_clients = {}
 
 banned_users = set()
 muted_until = {}
+group_chats = {}
 
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
@@ -246,6 +250,40 @@ def send_to_user(username, obj):
     except Exception:
         return False
 
+def find_online_username(target):
+    if target is None:
+        return None
+    value = str(target).strip()
+    if not value:
+        return None
+    value_lower = value.lower()
+    for name, info in user_data.items():
+        if name.lower() == value_lower or str(info.get("user_id")) == value:
+            return name
+    return None
+
+def group_snapshot(group):
+    return {
+        "id": group["id"],
+        "name": group["name"],
+        "owner": group["owner"],
+        "members": sorted(group["members"], key=str.lower),
+        "createdAt": group["created_at"],
+        "messages": list(group["messages"]),
+    }
+
+def groups_for_user(username):
+    return [
+        group_snapshot(group)
+        for group in group_chats.values()
+        if username in group["members"]
+    ]
+
+def push_group_update(group):
+    snapshot = group_snapshot(group)
+    for member in group["members"]:
+        send_to_user(member, {"type": "group_updated", "group": snapshot})
+
 def push_presence():
     users = get_user_list()
     admins = get_user_list_admin()
@@ -449,12 +487,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 "game": raw_game,
                 "placeId": place_id,
                 "jobId": job_id,
+                "activityHidden": activity_hidden,
             }
         )
 
         self.send({"type": "user_list", "users": get_user_list()})
         if is_admin:
             self.send({"type": "user_list_admin", "users": get_user_list_admin()})
+        self.send({"type": "group_list", "groups": groups_for_user(username)})
 
     def handle_chat(self, data):
         if not self.username:
@@ -529,6 +569,19 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         push_presence()
         self.send({"type": "hidden_updated", "hidden": new_hidden})
 
+    def handle_set_activity_hidden(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        new_hidden = bool(data.get("activityHidden", data.get("activity_hidden", False)))
+        info = user_data.get(self.username)
+        if not info:
+            self.send_error_msg("Not registered")
+            return
+        info["activity_hidden"] = new_hidden
+        push_presence()
+        self.send({"type": "activity_updated", "activityHidden": new_hidden})
+
     def handle_typing(self, data):
         if not self.username:
             self.send_error_msg("Not registered")
@@ -578,6 +631,146 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         send_to_user(self.username, payload)
         if not send_to_user(target, payload):
             self.send_error_msg(f"User '{target}' is not online")
+
+    def handle_group_list(self):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        self.send({"type": "group_list", "groups": groups_for_user(self.username)})
+
+    def handle_group_create(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        if user_data.get(self.username, {}).get("hidden"):
+            self.send_error_msg("Hidden users cannot create group chats")
+            return
+        if is_banned(self.username):
+            self.send_error_msg("You are banned from NA Chat")
+            return
+        if get_mute_info(self.username):
+            self.send_error_msg("You are muted in NA Chat")
+            return
+        if sum(1 for group in group_chats.values() if self.username in group["members"]) >= CONFIG["max_groups_per_user"]:
+            self.send_error_msg("Group chat limit reached")
+            return
+
+        name = sanitize_text((data.get("name") or "").strip(), CONFIG["max_group_name_length"])
+        if not name:
+            self.send_error_msg("Group name cannot be empty")
+            return
+
+        raw_members = data.get("members")
+        if not isinstance(raw_members, list):
+            raw_members = []
+        members = {self.username}
+        for target in raw_members:
+            resolved = find_online_username(target)
+            if resolved:
+                members.add(resolved)
+            if len(members) >= CONFIG["max_group_members"]:
+                break
+
+        group_id = uuid.uuid4().hex[:12]
+        group = {
+            "id": group_id,
+            "name": name,
+            "owner": self.username,
+            "members": members,
+            "created_at": time.time(),
+            "messages": deque(maxlen=100),
+        }
+        group_chats[group_id] = group
+        snapshot = group_snapshot(group)
+        for member in members:
+            if member != self.username:
+                send_to_user(member, {"type": "group_invite", "group": snapshot})
+        push_group_update(group)
+
+    def handle_group_invite(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        group = group_chats.get(str(data.get("groupId") or ""))
+        if not group:
+            self.send_error_msg("Group chat not found")
+            return
+        if group["owner"] != self.username:
+            self.send_error_msg("Only the group owner can invite users")
+            return
+        if len(group["members"]) >= CONFIG["max_group_members"]:
+            self.send_error_msg("Group member limit reached")
+            return
+        target = find_online_username(data.get("target"))
+        if not target:
+            self.send_error_msg("User is not online")
+            return
+        if target in group["members"]:
+            return
+        if sum(1 for item in group_chats.values() if target in item["members"]) >= CONFIG["max_groups_per_user"]:
+            self.send_error_msg("Target group chat limit reached")
+            return
+        group["members"].add(target)
+        snapshot = group_snapshot(group)
+        send_to_user(target, {"type": "group_invite", "group": snapshot})
+        push_group_update(group)
+
+    def handle_group_leave(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        group_id = str(data.get("groupId") or "")
+        group = group_chats.get(group_id)
+        if not group or self.username not in group["members"]:
+            self.send_error_msg("Group chat not found")
+            return
+        if group["owner"] == self.username:
+            group_chats.pop(group_id, None)
+            for member in group["members"]:
+                if member != self.username:
+                    send_to_user(member, {"type": "group_removed", "groupId": group_id})
+            return
+        group["members"].discard(self.username)
+        push_group_update(group)
+        self.send({"type": "group_removed", "groupId": group_id})
+
+    def handle_group_message(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        if user_data.get(self.username, {}).get("hidden"):
+            self.send_error_msg("Hidden users cannot send messages")
+            return
+        if is_banned(self.username):
+            self.send_error_msg("You are banned from NA Chat")
+            return
+        mute_info = get_mute_info(self.username)
+        if mute_info:
+            self.send_error_msg("You are muted in NA Chat")
+            return
+        group = group_chats.get(str(data.get("groupId") or ""))
+        if not group or self.username not in group["members"]:
+            self.send_error_msg("Group chat not found")
+            return
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
+        if not message:
+            self.send_error_msg("Message cannot be empty")
+            return
+        payload = {
+            "type": "group_message",
+            "groupId": group["id"],
+            "groupName": group["name"],
+            "from": self.username,
+            "message": message,
+        }
+        payload["timestamp"] = time.time()
+        group["messages"].append({
+            "from": self.username,
+            "message": message,
+            "timestamp": payload["timestamp"],
+        })
+        for member in group["members"]:
+            send_to_user(member, payload)
 
     def handle_remote_cmd(self, data):
         if not self.username:
@@ -798,12 +991,24 @@ def dispatch_message(client, data):
         client.handle_get_users_admin()
     elif t == "set_hidden":
         client.handle_set_hidden(data)
+    elif t == "set_activity_hidden":
+        client.handle_set_activity_hidden(data)
     elif t == "remote_cmd":
         client.handle_remote_cmd(data)
     elif t == "typing":
         client.handle_typing(data)
     elif t == "private_chat":
         client.handle_private_chat(data)
+    elif t == "group_list":
+        client.handle_group_list()
+    elif t == "group_create":
+        client.handle_group_create(data)
+    elif t == "group_invite":
+        client.handle_group_invite(data)
+    elif t == "group_leave":
+        client.handle_group_leave(data)
+    elif t == "group_message":
+        client.handle_group_message(data)
     elif t == "announcement":
         client.handle_announcement(data)
     elif t == "notify":

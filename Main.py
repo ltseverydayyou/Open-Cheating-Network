@@ -279,6 +279,13 @@ def groups_for_user(username):
         if username in group["members"]
     ]
 
+def pending_groups_for_user(username):
+    return [
+        group_snapshot(group)
+        for group in group_chats.values()
+        if username in group.get("pending", set())
+    ]
+
 def push_group_update(group):
     snapshot = group_snapshot(group)
     for member in group["members"]:
@@ -495,6 +502,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if is_admin:
             self.send({"type": "user_list_admin", "users": get_user_list_admin()})
         self.send({"type": "group_list", "groups": groups_for_user(username)})
+        for group in pending_groups_for_user(username):
+            self.send({"type": "group_invite", "group": group})
 
     def handle_chat(self, data):
         if not self.username:
@@ -664,12 +673,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not isinstance(raw_members, list):
             raw_members = []
         members = {self.username}
-        for target in raw_members:
-            resolved = find_online_username(target)
-            if resolved:
-                members.add(resolved)
-            if len(members) >= CONFIG["max_group_members"]:
-                break
 
         group_id = uuid.uuid4().hex[:12]
         group = {
@@ -677,14 +680,22 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "name": name,
             "owner": self.username,
             "members": members,
+            "pending": set(),
             "created_at": time.time(),
             "messages": deque(maxlen=100),
         }
         group_chats[group_id] = group
+        for target in raw_members:
+            resolved = find_online_username(target)
+            if resolved and resolved != self.username and resolved not in group["members"]:
+                if len(group["members"]) + len(group["pending"]) >= CONFIG["max_group_members"]:
+                    break
+                if sum(1 for item in group_chats.values() if resolved in item["members"] or resolved in item.get("pending", set())) >= CONFIG["max_groups_per_user"]:
+                    continue
+                group["pending"].add(resolved)
         snapshot = group_snapshot(group)
-        for member in members:
-            if member != self.username:
-                send_to_user(member, {"type": "group_invite", "group": snapshot})
+        for target in group["pending"]:
+            send_to_user(target, {"type": "group_invite", "group": snapshot})
         push_group_update(group)
 
     def handle_group_invite(self, data):
@@ -698,22 +709,63 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if group["owner"] != self.username:
             self.send_error_msg("Only the group owner can invite users")
             return
-        if len(group["members"]) >= CONFIG["max_group_members"]:
+        pending = group.setdefault("pending", set())
+        if len(group["members"]) + len(pending) >= CONFIG["max_group_members"]:
             self.send_error_msg("Group member limit reached")
             return
         target = find_online_username(data.get("target"))
         if not target:
             self.send_error_msg("User is not online")
             return
-        if target in group["members"]:
+        if target in group["members"] or target in pending:
             return
-        if sum(1 for item in group_chats.values() if target in item["members"]) >= CONFIG["max_groups_per_user"]:
+        if sum(1 for item in group_chats.values() if target in item["members"] or target in item.get("pending", set())) >= CONFIG["max_groups_per_user"]:
             self.send_error_msg("Target group chat limit reached")
             return
-        group["members"].add(target)
+        pending.add(target)
         snapshot = group_snapshot(group)
         send_to_user(target, {"type": "group_invite", "group": snapshot})
         push_group_update(group)
+
+    def handle_group_accept(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        group_id = str(data.get("groupId") or "")
+        group = group_chats.get(group_id)
+        if not group:
+            self.send_error_msg("Group chat not found")
+            return
+        pending = group.setdefault("pending", set())
+        if self.username not in pending:
+            if self.username in group["members"]:
+                self.send({"type": "group_updated", "group": group_snapshot(group)})
+            else:
+                self.send_error_msg("Group invitation not found")
+            return
+        if len(group["members"]) >= CONFIG["max_group_members"]:
+            self.send_error_msg("Group member limit reached")
+            return
+        if sum(1 for item in group_chats.values() if self.username in item["members"]) >= CONFIG["max_groups_per_user"]:
+            self.send_error_msg("Group chat limit reached")
+            return
+        pending.discard(self.username)
+        group["members"].add(self.username)
+        push_group_update(group)
+
+    def handle_group_decline(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        group_id = str(data.get("groupId") or "")
+        group = group_chats.get(group_id)
+        if not group:
+            self.send_error_msg("Group chat not found")
+            return
+        pending = group.setdefault("pending", set())
+        if self.username in pending:
+            pending.discard(self.username)
+            push_group_update(group)
 
     def handle_group_leave(self, data):
         if not self.username:
@@ -726,7 +778,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         if group["owner"] == self.username:
             group_chats.pop(group_id, None)
-            for member in group["members"]:
+            recipients = set(group["members"]) | set(group.get("pending", set()))
+            for member in recipients:
                 if member != self.username:
                     send_to_user(member, {"type": "group_removed", "groupId": group_id})
             return
@@ -1005,6 +1058,10 @@ def dispatch_message(client, data):
         client.handle_group_create(data)
     elif t == "group_invite":
         client.handle_group_invite(data)
+    elif t == "group_accept":
+        client.handle_group_accept(data)
+    elif t == "group_decline":
+        client.handle_group_decline(data)
     elif t == "group_leave":
         client.handle_group_leave(data)
     elif t == "group_message":

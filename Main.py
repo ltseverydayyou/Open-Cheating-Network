@@ -119,6 +119,8 @@ def fetch_roblox_user(user_id: int):
 def get_user_list():
     result = []
     for u, d in user_data.items():
+        if connections.get(u) is not d.get("connection"):
+            continue
         if d.get("hidden", False):
             continue
         activity_hidden = bool(d.get("activity_hidden", False))
@@ -141,6 +143,8 @@ def get_user_list():
 def get_user_list_admin():
     result = []
     for u, d in user_data.items():
+        if connections.get(u) is not d.get("connection"):
+            continue
         username = sanitize_text(u, CONFIG["max_username_length"])
         display_name = sanitize_text(d.get("display_name") or "", CONFIG["max_username_length"])
         game_status = sanitize_text(d.get("game_status") or "", CONFIG["max_game_name_length"])
@@ -294,23 +298,15 @@ def push_group_update(group):
 def push_presence():
     users = get_user_list()
     admins = get_user_list_admin()
-    now = time.time()
 
     for name, ws in list(connections.items()):
         info = user_data.get(name) or {}
-        if info.get("hidden"):
+        if info.get("connection") is not ws or info.get("hidden"):
             continue
 
-        try:
-            ws.write_message(json.dumps({"type": "user_list", "users": users, "timestamp": now}, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
+        ws.send({"type": "user_list", "users": users})
         if info.get("admin"):
-            try:
-                ws.write_message(json.dumps({"type": "user_list_admin", "users": admins, "timestamp": now}, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
+            ws.send({"type": "user_list_admin", "users": admins})
 
 class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
@@ -362,13 +358,16 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             max_chunk = 50
             if total > max_chunk:
                 chunks = (total + max_chunk - 1) // max_chunk
+                snapshot_id = uuid.uuid4().hex
+                snapshot_time = time.time()
                 for i in range(0, total, max_chunk):
                     chunk = dict(obj)
                     chunk_users = users[i : i + max_chunk]
                     chunk["users"] = chunk_users
                     chunk["chunkIndex"] = i // max_chunk
                     chunk["chunkTotal"] = chunks
-                    chunk["timestamp"] = time.time()
+                    chunk["snapshotId"] = snapshot_id
+                    chunk["timestamp"] = snapshot_time
                     try:
                         self.write_message(json.dumps(chunk, ensure_ascii=False) + "\n")
                     except Exception:
@@ -390,6 +389,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name=""):
         connections[username] = self
         user_data[username] = {
+            "connection": self,
+            "session_id": uuid.uuid4().hex,
             "hidden": hidden,
             "last_seen": time.time(),
             "user_id": user_id,
@@ -405,8 +406,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         u = self.username
         if not u:
             return
+        if connections.get(u) is not self:
+            self.username = None
+            return
         connections.pop(u, None)
-        user_data.pop(u, None)
+        info = user_data.get(u)
+        if info and info.get("connection") is self:
+            user_data.pop(u, None)
+        self.username = None
         push_presence()
 
     def handle_register(self, data):
@@ -463,10 +470,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 pass
 
         is_admin = user_id in ADMIN_IDS
-        if is_admin and ADMIN_SECRET:
-            provided = data.get("adminKey")
-            if not (isinstance(provided, str) and provided and provided == ADMIN_SECRET):
-                is_admin = False
 
         self.username = username
         self.add_user(
@@ -540,7 +543,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not self.username:
             return
         d = user_data.get(self.username)
-        if d:
+        if d and connections.get(self.username) is self and d.get("connection") is self:
             d["last_seen"] = time.time()
         self.send({"type": "heartbeat_ack"})
 
@@ -1196,19 +1199,24 @@ def cleanup_inactive_users():
     now = time.time()
     to_remove = []
     for name, data in list(user_data.items()):
+        ws = connections.get(name)
+        if not ws or data.get("connection") is not ws:
+            continue
         last_seen = data.get("last_seen", now)
         if now - last_seen > timeout:
-            to_remove.append(name)
+            to_remove.append((name, ws))
 
-    for name in to_remove:
+    for name, ws in to_remove:
         print("Removing inactive user", name)
-        ws = connections.pop(name, None)
-        user_data.pop(name, None)
-        if ws:
-            try:
-                ws.close(1000, "Inactive timeout")
-            except Exception:
-                pass
+        if connections.get(name) is ws:
+            connections.pop(name, None)
+        info = user_data.get(name)
+        if info and info.get("connection") is ws:
+            user_data.pop(name, None)
+        try:
+            ws.close(1000, "Inactive timeout")
+        except Exception:
+            pass
 
     for client_id, client in list(http_clients.items()):
         if client.closed or now - client.last_seen > timeout:

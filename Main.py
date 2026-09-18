@@ -17,6 +17,7 @@ CONFIG = {
     "max_group_name_length": 50,
     "max_group_members": 50,
     "max_groups_per_user": 20,
+    "max_chat_history": 1000,
 }
 
 ADMIN_IDS = {
@@ -39,6 +40,8 @@ http_clients = {}
 banned_users = set()
 muted_until = {}
 group_chats = {}
+chat_messages = {}
+chat_message_order = deque()
 
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
@@ -58,6 +61,12 @@ def sanitize_text(s, max_len=None):
     if max_len is not None and len(cleaned) > max_len:
         cleaned = cleaned[:max_len]
     return cleaned
+
+def normalize_chat_color(value, default="78AAFF"):
+    text = sanitize_text(value or "", 16).strip().lstrip("#").upper()
+    if len(text) == 6 and all(ch in "0123456789ABCDEF" for ch in text):
+        return text
+    return default
 
 ADMIN_SECRET = os.environ.get("ADMIN_KEY", "").strip()
 
@@ -133,6 +142,7 @@ def get_user_list():
                 "displayName": display_name,
                 "userId": d.get("user_id"),
                 "admin": bool(d.get("admin", False)),
+                "chatColor": normalize_chat_color(d.get("chat_color")),
                 "game": "Game: Hidden" if activity_hidden else game_status,
                 "placeId": None if activity_hidden else d.get("place_id"),
                 "jobId": None if activity_hidden else d.get("job_id"),
@@ -154,6 +164,7 @@ def get_user_list_admin():
                 "displayName": display_name,
                 "userId": d.get("user_id"),
                 "admin": bool(d.get("admin", False)),
+                "chatColor": normalize_chat_color(d.get("chat_color")),
                 "hidden": bool(d.get("hidden", False)),
                 "activityHidden": bool(d.get("activity_hidden", False)),
                 "game": game_status,
@@ -232,8 +243,9 @@ def get_mute_list():
     return out
 
 def broadcast(obj, exclude=None):
-    obj["timestamp"] = time.time()
-    msg = json.dumps(obj, ensure_ascii=False) + "\n"
+    payload = dict(obj)
+    payload.setdefault("timestamp", time.time())
+    msg = json.dumps(payload, ensure_ascii=False) + "\n"
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
             continue
@@ -246,10 +258,10 @@ def send_to_user(username, obj):
     ws = connections.get(username)
     if not ws:
         return False
-    obj = dict(obj)
-    obj["timestamp"] = time.time()
+    payload = dict(obj)
+    payload.setdefault("timestamp", time.time())
     try:
-        ws.write_message(json.dumps(obj, ensure_ascii=False) + "\n")
+        ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False
@@ -265,6 +277,46 @@ def find_online_username(target):
         if name.lower() == value_lower or str(info.get("user_id")) == value:
             return name
     return None
+
+def _trim_chat_history():
+    limit = max(100, int(CONFIG.get("max_chat_history") or 1000))
+    while len(chat_message_order) > limit:
+        message_id = chat_message_order.popleft()
+        chat_messages.pop(message_id, None)
+
+def _chat_reply_snapshot(record):
+    if not isinstance(record, dict) or record.get("deleted"):
+        return None
+    return {
+        "messageId": record.get("message_id"),
+        "username": record.get("username"),
+        "displayName": record.get("display_name") or "",
+        "userId": record.get("user_id"),
+        "message": record.get("message") or "",
+        "edited": bool(record.get("edited", False)),
+    }
+
+def _chat_payload(record, event_type="chat"):
+    return {
+        "type": event_type,
+        "messageId": record.get("message_id"),
+        "username": record.get("username"),
+        "displayName": record.get("display_name") or "",
+        "message": record.get("message") or "",
+        "timestamp": record.get("timestamp"),
+        "userId": record.get("user_id"),
+        "admin": bool(record.get("admin", False)),
+        "game": record.get("game") or "",
+        "chatColor": normalize_chat_color(record.get("chat_color")),
+        "reply": record.get("reply"),
+        "edited": bool(record.get("edited", False)),
+        "editedAt": record.get("edited_at"),
+    }
+
+def _chat_record_owned_by(record, info):
+    if not isinstance(record, dict) or not isinstance(info, dict):
+        return False
+    return record.get("user_id") == info.get("user_id") and record.get("username") == info.get("username")
 
 def group_snapshot(group):
     return {
@@ -373,9 +425,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     except Exception:
                         pass
                 return
-        obj["timestamp"] = time.time()
+        payload = dict(obj)
+        payload.setdefault("timestamp", time.time())
         try:
-            self.write_message(json.dumps(obj, ensure_ascii=False) + "\n")
+            self.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -386,11 +439,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name=""):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name="", chat_color="78AAFF"):
         connections[username] = self
         user_data[username] = {
             "connection": self,
             "session_id": uuid.uuid4().hex,
+            "username": username,
             "hidden": hidden,
             "last_seen": time.time(),
             "user_id": user_id,
@@ -400,6 +454,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "job_id": job_id,
             "activity_hidden": bool(activity_hidden),
             "display_name": display_name or "",
+            "chat_color": normalize_chat_color(chat_color),
         }
 
     def remove_user(self):
@@ -431,6 +486,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         raw_game = (data.get("game") or "").strip()
         place_id = data.get("placeId")
         job_id = data.get("jobId")
+        chat_color = normalize_chat_color(data.get("chatColor"))
 
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
@@ -482,6 +538,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             job_id=job_id,
             activity_hidden=activity_hidden,
             display_name=display_name,
+            chat_color=chat_color,
         )
         push_presence()
 
@@ -490,6 +547,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 "type": "registered",
                 "username": username,
                 "displayName": display_name,
+                "chatColor": chat_color,
                 "token": "dummy_token",
                 "hidden": hidden,
                 "userId": user_id,
@@ -512,7 +570,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not self.username:
             self.send_error_msg("Not registered")
             return
-        if user_data.get(self.username, {}).get("hidden"):
+        info = user_data.get(self.username, {})
+        if info.get("connection") is not self:
+            self.send_error_msg("Not registered")
+            return
+        if info.get("hidden"):
             self.send_error_msg("Hidden users cannot send messages")
             return
         if is_banned(self.username):
@@ -532,12 +594,87 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Message cannot be empty")
             return
 
-        info = user_data.get(self.username, {})
-        user_id = info.get("user_id")
-        is_admin = bool(info.get("admin", False))
-        game_status = info.get("game_status") or ""
+        reply = None
+        reply_id = sanitize_text(data.get("replyTo") or "", 64).strip()
+        if reply_id:
+            reply = _chat_reply_snapshot(chat_messages.get(reply_id))
+            if not reply:
+                self.send_error_msg("Reply target is no longer available", code="reply_target_missing")
+                return
 
-        broadcast({"type": "chat", "username": self.username, "message": msg, "userId": user_id, "admin": is_admin, "game": game_status})
+        now = time.time()
+        message_id = uuid.uuid4().hex[:20]
+        record = {
+            "message_id": message_id,
+            "username": self.username,
+            "display_name": info.get("display_name") or "",
+            "message": msg,
+            "timestamp": now,
+            "user_id": info.get("user_id"),
+            "admin": bool(info.get("admin", False)),
+            "game": info.get("game_status") or "",
+            "chat_color": normalize_chat_color(info.get("chat_color")),
+            "reply": reply,
+            "edited": False,
+            "edited_at": None,
+            "deleted": False,
+        }
+        chat_messages[message_id] = record
+        chat_message_order.append(message_id)
+        _trim_chat_history()
+        broadcast(_chat_payload(record, "chat"))
+
+    def handle_edit_message(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        info = user_data.get(self.username, {})
+        if info.get("connection") is not self:
+            self.send_error_msg("Not registered")
+            return
+        message_id = sanitize_text(data.get("messageId") or "", 64).strip()
+        record = chat_messages.get(message_id)
+        if not record or record.get("deleted"):
+            self.send_error_msg("Message not found", code="message_not_found")
+            return
+        if not _chat_record_owned_by(record, info):
+            self.send_error_msg("You can only edit your own messages", code="message_not_owned")
+            return
+        message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
+        if not message:
+            self.send_error_msg("Message cannot be empty")
+            return
+        record["message"] = message
+        record["edited"] = True
+        record["edited_at"] = time.time()
+        broadcast(_chat_payload(record, "message_edited"))
+
+    def handle_delete_message(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        info = user_data.get(self.username, {})
+        if info.get("connection") is not self:
+            self.send_error_msg("Not registered")
+            return
+        message_id = sanitize_text(data.get("messageId") or "", 64).strip()
+        record = chat_messages.get(message_id)
+        if not record or record.get("deleted"):
+            self.send_error_msg("Message not found", code="message_not_found")
+            return
+        if not _chat_record_owned_by(record, info):
+            self.send_error_msg("You can only delete your own messages", code="message_not_owned")
+            return
+        record["deleted"] = True
+        record["deleted_at"] = time.time()
+        broadcast({
+            "type": "message_deleted",
+            "messageId": message_id,
+            "username": record.get("username"),
+            "displayName": record.get("display_name") or "",
+            "userId": record.get("user_id"),
+            "timestamp": record.get("deleted_at"),
+        })
 
     def handle_heartbeat(self):
         if not self.username:
@@ -593,6 +730,18 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         info["activity_hidden"] = new_hidden
         push_presence()
         self.send({"type": "activity_updated", "activityHidden": new_hidden})
+
+    def handle_set_chat_color(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        info = user_data.get(self.username)
+        if not info or info.get("connection") is not self:
+            self.send_error_msg("Not registered")
+            return
+        color = normalize_chat_color(data.get("chatColor"))
+        info["chat_color"] = color
+        self.send({"type": "chat_color_updated", "chatColor": color})
 
     def handle_typing(self, data):
         if not self.username:
@@ -812,16 +961,25 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not message:
             self.send_error_msg("Message cannot be empty")
             return
+        info = user_data.get(self.username, {})
         payload = {
             "type": "group_message",
             "groupId": group["id"],
             "groupName": group["name"],
             "from": self.username,
+            "displayName": info.get("display_name") or "",
+            "userId": info.get("user_id"),
+            "admin": bool(info.get("admin", False)),
+            "chatColor": normalize_chat_color(info.get("chat_color")),
             "message": message,
         }
         payload["timestamp"] = time.time()
         group["messages"].append({
             "from": self.username,
+            "displayName": info.get("display_name") or "",
+            "userId": info.get("user_id"),
+            "admin": bool(info.get("admin", False)),
+            "chatColor": normalize_chat_color(info.get("chat_color")),
             "message": message,
             "timestamp": payload["timestamp"],
         })
@@ -1039,6 +1197,10 @@ def dispatch_message(client, data):
         client.handle_register(data)
     elif t == "chat":
         client.handle_chat(data)
+    elif t == "edit_message":
+        client.handle_edit_message(data)
+    elif t == "delete_message":
+        client.handle_delete_message(data)
     elif t == "heartbeat":
         client.handle_heartbeat()
     elif t == "get_users":
@@ -1049,6 +1211,8 @@ def dispatch_message(client, data):
         client.handle_set_hidden(data)
     elif t == "set_activity_hidden":
         client.handle_set_activity_hidden(data)
+    elif t == "set_chat_color":
+        client.handle_set_chat_color(data)
     elif t == "remote_cmd":
         client.handle_remote_cmd(data)
     elif t == "typing":

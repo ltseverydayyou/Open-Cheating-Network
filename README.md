@@ -55,6 +55,24 @@ Servers endpoints:
 - `/axxum/disconnect` - HTTP fallback disconnect
 - `/healthz` - health check
 
+## Dynamic Public Endpoint
+
+The current public NA Chat origin is stored in `Client/endpoint.txt`.
+
+`Client/NewClient.luau` resolves that file before connecting, so a changing tunnel hostname can be updated without rebuilding the client. The endpoint file may contain either an HTTPS base URL such as:
+
+```text
+https://example.trycloudflare.com
+```
+
+or a full WebSocket endpoint such as:
+
+```text
+wss://example.trycloudflare.com/axxum
+```
+
+For Quick Tunnels, update only `Client/endpoint.txt` whenever Cloudflare gives you a new hostname.
+
 ## Client Setup (Lua)
 
 ### Basic Usage

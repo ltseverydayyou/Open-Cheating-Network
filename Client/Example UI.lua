@@ -738,8 +738,36 @@ integration_service.OnError.Event:Connect(function(error_message, timestamp)
     add_message("ERROR", error_message)
 end)
 
+local endpoint_url = "wss://sydney-nextel-heath-thriller.trycloudflare.com/axxum"
+do
+    local ok, response = pcall(req, {
+        Url = "https://raw.githubusercontent.com/ltseverydayyou/Open-Cheating-Network/refs/heads/main/Client/endpoint.txt?na_endpoint=" .. tostring(os.time()),
+        Method = "GET"
+    })
+    if ok and type(response) == "table" then
+        local raw = response.Body or response.body
+        if type(raw) == "string" then
+            local candidate = raw:match("^%s*(.-)%s*$")
+            if candidate and candidate ~= "" then
+                candidate = candidate:gsub("/healthz/?$", ""):gsub("/+$", "")
+                if candidate:match("^https://") then
+                    candidate = "wss://" .. candidate:sub(9)
+                elseif candidate:match("^http://") then
+                    candidate = "ws://" .. candidate:sub(8)
+                end
+                if candidate:match("^wss?://") then
+                    if not candidate:match("/axxum$") then
+                        candidate = candidate .. "/axxum"
+                    end
+                    endpoint_url = candidate
+                end
+            end
+        end
+    end
+end
+
 integration_service.Init({
-    serverUrl = "wss://open-cheating-network.onrender.com/axxum",
+    serverUrl = endpoint_url,
     heartbeatInterval = 5,
     autoReconnect = true,
     hidden = false

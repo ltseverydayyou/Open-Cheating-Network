@@ -2,9 +2,9 @@ import os
 import json
 import time
 import urllib.parse
-import urllib.request
 import uuid
 from collections import deque
+import tornado.httpclient
 import tornado.ioloop
 import tornado.web
 import tornado.websocket
@@ -45,6 +45,8 @@ chat_message_order = deque()
 
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
+PRESENCE_UPDATE_DELAY = 0.75
+PRESENCE_UPDATE_HANDLE = None
 
 def sanitize_text(s, max_len=None):
     if s is None:
@@ -103,22 +105,31 @@ def roblox_api_urls(url: str):
         urllib.parse.urlunsplit(parsed._replace(netloc=f"{subdomain}.roblox.com")),
     ]
 
-def fetch_roblox_user(user_id: int):
+async def fetch_roblox_user(user_id: int):
     now = time.time()
     cached = ROBLOX_USER_CACHE.get(user_id)
     if cached and (now - cached.get("ts", 0)) < ROBLOX_USER_CACHE_TTL:
         return cached.get("name"), cached.get("displayName")
 
     url = f"https://users.roblox.com/v1/users/{int(user_id)}"
+    http_client = tornado.httpclient.AsyncHTTPClient()
     for api_url in roblox_api_urls(url):
         try:
-            with urllib.request.urlopen(api_url, timeout=4.0) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore")
-            data = json.loads(raw)
+            request = tornado.httpclient.HTTPRequest(
+                api_url,
+                method="GET",
+                connect_timeout=2.0,
+                request_timeout=4.0,
+                headers={"User-Agent": "NA-Chat/1.0"},
+            )
+            response = await http_client.fetch(request, raise_error=False)
+            if response.code != 200:
+                continue
+            data = json.loads(response.body.decode("utf-8", errors="ignore"))
             name = sanitize_text(data.get("name") or "", CONFIG["max_username_length"])
             display = sanitize_text(data.get("displayName") or "", CONFIG["max_username_length"])
             if name:
-                ROBLOX_USER_CACHE[user_id] = {"ts": now, "name": name, "displayName": display}
+                ROBLOX_USER_CACHE[user_id] = {"ts": time.time(), "name": name, "displayName": display}
                 return name, display
         except Exception:
             pass
@@ -365,6 +376,22 @@ def push_presence():
         if info.get("admin"):
             ws.send({"type": "user_list_admin", "users": admins})
 
+
+def _flush_presence():
+    global PRESENCE_UPDATE_HANDLE
+    PRESENCE_UPDATE_HANDLE = None
+    push_presence()
+
+
+def schedule_presence():
+    global PRESENCE_UPDATE_HANDLE
+    if PRESENCE_UPDATE_HANDLE is not None:
+        return
+    PRESENCE_UPDATE_HANDLE = tornado.ioloop.IOLoop.current().call_later(
+        PRESENCE_UPDATE_DELAY,
+        _flush_presence,
+    )
+
 class IntegrationHandler(tornado.websocket.WebSocketHandler):
     def check_origin(self, origin):
         return True
@@ -384,17 +411,17 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         self.ip = self.request.remote_ip
         print("new connection from", self.ip)
 
-    def on_message(self, message):
+    async def on_message(self, message):
         try:
             data = json.loads(message)
         except Exception:
             self.send_error_msg("Invalid JSON")
             return
 
-        dispatch_message(self, data)
+        await dispatch_message(self, data)
 
-    def _dispatch_message(self, data):
-        dispatch_message(self, data)
+    async def _dispatch_message(self, data):
+        await dispatch_message(self, data)
 
     def _close_client(self):
         self.on_close()
@@ -474,9 +501,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if info and info.get("connection") is self:
             user_data.pop(u, None)
         self.username = None
-        push_presence()
+        schedule_presence()
 
-    def handle_register(self, data):
+    async def handle_register(self, data):
         if data.get("is_server") is not True:
             self.send_error_msg("Client outdated / not allowed", code="client_blocked")
             try:
@@ -501,7 +528,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Missing/invalid userId")
             return
 
-        rb_name, rb_display = fetch_roblox_user(user_id)
+        rb_name, rb_display = await fetch_roblox_user(user_id)
         if not rb_name:
             self.send_error_msg("Could not verify Roblox user")
             return
@@ -545,7 +572,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             display_name=display_name,
             chat_color=chat_color,
         )
-        push_presence()
+        schedule_presence()
 
         self.send(
             {
@@ -720,7 +747,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if new_hidden == old_hidden:
             return
         user_data[self.username]["hidden"] = new_hidden
-        push_presence()
+        schedule_presence()
         self.send({"type": "hidden_updated", "hidden": new_hidden})
 
     def handle_set_activity_hidden(self, data):
@@ -733,7 +760,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Not registered")
             return
         info["activity_hidden"] = new_hidden
-        push_presence()
+        schedule_presence()
         self.send({"type": "activity_updated", "activityHidden": new_hidden})
 
     def handle_set_chat_color(self, data):
@@ -752,10 +779,19 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not self.username:
             self.send_error_msg("Not registered")
             return
-        if user_data.get(self.username, {}).get("hidden"):
+        info = user_data.get(self.username, {})
+        if info.get("hidden"):
             return
         is_typing = bool(data.get("is_typing", False))
-        scope = data.get("scope") or "global"
+        scope = sanitize_text(data.get("scope") or "global", 64)
+        now = time.monotonic()
+        state = (is_typing, scope)
+        previous_state = info.get("typing_state")
+        previous_time = float(info.get("typing_broadcast_at") or 0.0)
+        if state == previous_state and now - previous_time < 0.5:
+            return
+        info["typing_state"] = state
+        info["typing_broadcast_at"] = now
         broadcast({"type": "typing", "username": self.username, "is_typing": is_typing, "scope": scope}, exclude=self.username)
 
     def handle_private_chat(self, data):
@@ -1192,14 +1228,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         self.send({"type": "admin_state", "banned": get_ban_list(), "muted": get_mute_list()})
 
 
-def dispatch_message(client, data):
+async def dispatch_message(client, data):
     if not isinstance(data, dict):
         client.send_error_msg("Invalid JSON")
         return
 
     t = data.get("type")
     if t == "register":
-        client.handle_register(data)
+        await client.handle_register(data)
     elif t == "chat":
         client.handle_chat(data)
     elif t == "edit_message":
@@ -1287,12 +1323,12 @@ def decode_request_body(request):
 
 
 class AxxumRegisterHandler(tornado.web.RequestHandler):
-    def post(self):
+    async def post(self):
         data = decode_request_body(self.request)
         client_id = uuid.uuid4().hex
         client = HttpClient(client_id, self.request.remote_ip)
         http_clients[client_id] = client
-        dispatch_message(client, data)
+        await dispatch_message(client, data)
         client.last_seen = time.time()
         self.set_header("Content-Type", "application/json")
         self.write({"clientId": client_id})
@@ -1327,7 +1363,7 @@ class AxxumPollHandler(tornado.web.RequestHandler):
 
 
 class AxxumSendHandler(tornado.web.RequestHandler):
-    def post(self):
+    async def post(self):
         client_id = self.get_query_argument("clientId", default="")
         client = http_clients.get(client_id)
         if not client or client.closed:
@@ -1337,7 +1373,7 @@ class AxxumSendHandler(tornado.web.RequestHandler):
 
         data = decode_request_body(self.request)
         client.last_seen = time.time()
-        dispatch_message(client, data)
+        await dispatch_message(client, data)
         self.write("OK")
 
 
@@ -1392,7 +1428,7 @@ def cleanup_inactive_users():
             client.close(1000, "Inactive timeout")
 
     if to_remove:
-        push_presence()
+        schedule_presence()
 
 if __name__ == "__main__":
     app = make_app()

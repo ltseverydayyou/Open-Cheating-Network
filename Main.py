@@ -43,6 +43,8 @@ muted_until = {}
 group_chats = {}
 chat_messages = {}
 chat_message_order = deque()
+STATE_FILE = os.environ.get("OCN_STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocn_state.json")).strip()
+STATE_SAVE_HANDLE = None
 
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
@@ -364,6 +366,144 @@ def push_group_update(group):
     for member in group["members"]:
         send_to_user(member, {"type": "group_updated", "group": snapshot})
 
+def chat_history_snapshot():
+    history = []
+    for message_id in chat_message_order:
+        record = chat_messages.get(message_id)
+        if record and not record.get("deleted"):
+            history.append(_chat_payload(record, "chat"))
+    return history
+
+def _serialize_state():
+    groups = []
+    for group in group_chats.values():
+        groups.append({
+            "id": group["id"],
+            "name": group["name"],
+            "owner": group["owner"],
+            "members": sorted(group["members"], key=str.lower),
+            "pending": sorted(group.get("pending", set()), key=str.lower),
+            "created_at": group["created_at"],
+            "messages": list(group["messages"]),
+        })
+
+    history = []
+    for message_id in chat_message_order:
+        record = chat_messages.get(message_id)
+        if record and not record.get("deleted"):
+            history.append(record)
+
+    return {
+        "version": 1,
+        "groups": groups,
+        "chat_messages": history,
+    }
+
+def _save_state_now():
+    if not STATE_FILE:
+        return
+    try:
+        parent = os.path.dirname(STATE_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(_serialize_state(), f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, STATE_FILE)
+    except Exception as exc:
+        print("state save failed:", exc)
+
+def schedule_state_save():
+    global STATE_SAVE_HANDLE
+    if STATE_SAVE_HANDLE is not None:
+        return
+
+    def flush():
+        global STATE_SAVE_HANDLE
+        STATE_SAVE_HANDLE = None
+        _save_state_now()
+
+    try:
+        STATE_SAVE_HANDLE = tornado.ioloop.IOLoop.current().call_later(0.15, flush)
+    except Exception:
+        STATE_SAVE_HANDLE = None
+        _save_state_now()
+
+def _load_state():
+    if not STATE_FILE or not os.path.isfile(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        print("state load failed:", exc)
+        return
+
+    loaded_groups = payload.get("groups") if isinstance(payload, dict) else None
+    if isinstance(loaded_groups, list):
+        for item in loaded_groups:
+            if not isinstance(item, dict):
+                continue
+            group_id = sanitize_text(item.get("id") or "", 64).strip()
+            name = sanitize_text(item.get("name") or "", CONFIG["max_group_name_length"]).strip()
+            owner = sanitize_text(item.get("owner") or "", CONFIG["max_username_length"]).strip()
+            if not group_id or not name or not owner:
+                continue
+            members = {
+                sanitize_text(member, CONFIG["max_username_length"]).strip()
+                for member in (item.get("members") or [])
+                if sanitize_text(member, CONFIG["max_username_length"]).strip()
+            }
+            members.add(owner)
+            pending = {
+                sanitize_text(member, CONFIG["max_username_length"]).strip()
+                for member in (item.get("pending") or [])
+                if sanitize_text(member, CONFIG["max_username_length"]).strip()
+            }
+            pending.difference_update(members)
+            messages = deque(maxlen=100)
+            for message in item.get("messages") or []:
+                if isinstance(message, dict):
+                    text = sanitize_text(message.get("message") or "", CONFIG["max_message_length"])
+                    if text:
+                        restored = dict(message)
+                        restored["message"] = text
+                        messages.append(restored)
+            try:
+                created_at = float(item.get("created_at") or time.time())
+            except Exception:
+                created_at = time.time()
+            group_chats[group_id] = {
+                "id": group_id,
+                "name": name,
+                "owner": owner,
+                "members": members,
+                "pending": pending,
+                "created_at": created_at,
+                "messages": messages,
+            }
+
+    loaded_history = payload.get("chat_messages") if isinstance(payload, dict) else None
+    if isinstance(loaded_history, list):
+        for item in loaded_history:
+            if not isinstance(item, dict):
+                continue
+            message_id = sanitize_text(item.get("message_id") or "", 64).strip()
+            message = sanitize_text(item.get("message") or "", CONFIG["max_message_length"])
+            username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip()
+            if not message_id or not message or not username:
+                continue
+            record = dict(item)
+            record["message_id"] = message_id
+            record["message"] = message
+            record["username"] = username
+            record["deleted"] = False
+            chat_messages[message_id] = record
+            chat_message_order.append(message_id)
+        _trim_chat_history()
+
+_load_state()
+
 def push_presence():
     users = get_user_list()
     admins = get_user_list_admin()
@@ -593,6 +733,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             }
         )
 
+        self.send({"type": "chat_history", "messages": chat_history_snapshot()})
         self.send({"type": "user_list", "users": get_user_list()})
         if is_admin:
             self.send({"type": "user_list_admin", "users": get_user_list_admin()})
@@ -657,6 +798,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         chat_message_order.append(message_id)
         _trim_chat_history()
         broadcast(_chat_payload(record, "chat"))
+        schedule_state_save()
 
     def handle_edit_message(self, data):
         if not self.username:
@@ -682,6 +824,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         record["edited"] = True
         record["edited_at"] = time.time()
         broadcast(_chat_payload(record, "message_edited"))
+        schedule_state_save()
 
     def handle_delete_message(self, data):
         if not self.username:
@@ -709,6 +852,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "userId": record.get("user_id"),
             "timestamp": record.get("deleted_at"),
         })
+        schedule_state_save()
 
     def handle_heartbeat(self):
         if not self.username:
@@ -892,6 +1036,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         for target in group["pending"]:
             send_to_user(target, {"type": "group_invite", "group": snapshot})
         push_group_update(group)
+        schedule_state_save()
 
     def handle_group_invite(self, data):
         if not self.username:
@@ -921,6 +1066,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         snapshot = group_snapshot(group)
         send_to_user(target, {"type": "group_invite", "group": snapshot})
         push_group_update(group)
+        schedule_state_save()
 
     def handle_group_accept(self, data):
         if not self.username:
@@ -947,6 +1093,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         pending.discard(self.username)
         group["members"].add(self.username)
         push_group_update(group)
+        schedule_state_save()
 
     def handle_group_decline(self, data):
         if not self.username:
@@ -961,6 +1108,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if self.username in pending:
             pending.discard(self.username)
             push_group_update(group)
+            schedule_state_save()
 
     def handle_group_leave(self, data):
         if not self.username:
@@ -977,10 +1125,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             for member in recipients:
                 if member != self.username:
                     send_to_user(member, {"type": "group_removed", "groupId": group_id})
+            schedule_state_save()
             return
         group["members"].discard(self.username)
         push_group_update(group)
         self.send({"type": "group_removed", "groupId": group_id})
+        schedule_state_save()
 
     def handle_group_message(self, data):
         if not self.username:
@@ -1028,6 +1178,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         })
         for member in group["members"]:
             send_to_user(member, payload)
+        schedule_state_save()
 
     def handle_remote_cmd(self, data):
         if not self.username:

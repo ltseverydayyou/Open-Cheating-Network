@@ -318,6 +318,11 @@ def _chat_record_owned_by(record, info):
         return False
     return record.get("user_id") == info.get("user_id") and record.get("username") == info.get("username")
 
+def _chat_record_can_modify(record, info):
+    if not isinstance(record, dict) or not isinstance(info, dict):
+        return False
+    return _chat_record_owned_by(record, info) or bool(info.get("admin", False))
+
 def group_snapshot(group):
     return {
         "id": group["id"],
@@ -637,8 +642,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not record or record.get("deleted"):
             self.send_error_msg("Message not found", code="message_not_found")
             return
-        if not _chat_record_owned_by(record, info):
-            self.send_error_msg("You can only edit your own messages", code="message_not_owned")
+        if not _chat_record_can_modify(record, info):
+            self.send_error_msg("You are not allowed to edit this message", code="message_not_owned")
             return
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
@@ -662,8 +667,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not record or record.get("deleted"):
             self.send_error_msg("Message not found", code="message_not_found")
             return
-        if not _chat_record_owned_by(record, info):
-            self.send_error_msg("You can only delete your own messages", code="message_not_owned")
+        if not _chat_record_can_modify(record, info):
+            self.send_error_msg("You are not allowed to delete this message", code="message_not_owned")
             return
         record["deleted"] = True
         record["deleted_at"] = time.time()

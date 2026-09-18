@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import asyncio
 import urllib.parse
 import uuid
 from collections import deque
@@ -45,7 +46,7 @@ chat_message_order = deque()
 
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
-PRESENCE_UPDATE_DELAY = 0.75
+PRESENCE_UPDATE_DELAY = 5.0
 PRESENCE_UPDATE_HANDLE = None
 
 def sanitize_text(s, max_len=None):
@@ -479,6 +480,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "username": username,
             "hidden": hidden,
             "last_seen": time.time(),
+            "transport": "http" if hasattr(self, "client_id") else "websocket",
             "user_id": user_id,
             "admin": bool(is_admin),
             "game_status": game_status or "",
@@ -1298,15 +1300,18 @@ class HttpClient(IntegrationHandler):
         self.closed = False
         self.last_seen = time.time()
         self.queue = deque()
+        self.queue_event = asyncio.Event()
 
     def write_message(self, message, *args, **kwargs):
         if not self.closed:
             self.queue.append(message)
+            self.queue_event.set()
 
     def close(self, code=None, reason=None):
         if self.closed:
             return
         self.closed = True
+        self.queue_event.set()
         http_clients.pop(self.client_id, None)
         self.on_close()
 
@@ -1335,10 +1340,25 @@ class AxxumRegisterHandler(tornado.web.RequestHandler):
 
 
 class AxxumPollHandler(tornado.web.RequestHandler):
-    def get(self):
+    async def get(self):
         client_id = self.get_query_argument("clientId", default="")
         client = http_clients.get(client_id)
         if not client or client.closed:
+            self.set_status(404)
+            self.finish("Unknown clientId")
+            return
+
+        client.last_seen = time.time()
+
+        if not client.queue:
+            client.queue_event.clear()
+            if not client.queue and not client.closed:
+                try:
+                    await asyncio.wait_for(client.queue_event.wait(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        if client.closed:
             self.set_status(404)
             self.finish("Unknown clientId")
             return
@@ -1352,8 +1372,12 @@ class AxxumPollHandler(tornado.web.RequestHandler):
             except Exception:
                 continue
 
+        if not client.queue:
+            client.queue_event.clear()
+
         if not messages:
             self.set_status(204)
+            self.set_header("Cache-Control", "no-store")
             self.finish()
             return
 
@@ -1385,6 +1409,33 @@ class AxxumDisconnectHandler(tornado.web.RequestHandler):
             client.close(1000, "Client disconnected")
         self.write("OK")
 
+class StatsHandler(tornado.web.RequestHandler):
+    def get(self):
+        websocket_users = 0
+        http_users = 0
+        online = 0
+        for name, info in user_data.items():
+            if connections.get(name) is not info.get("connection"):
+                continue
+            online += 1
+            if info.get("transport") == "http":
+                http_users += 1
+            else:
+                websocket_users += 1
+
+        queued_http_messages = sum(len(client.queue) for client in http_clients.values() if not client.closed)
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        self.write({
+            "online": online,
+            "websocket": websocket_users,
+            "httpFallback": http_users,
+            "httpClients": sum(1 for client in http_clients.values() if not client.closed),
+            "queuedHttpMessages": queued_http_messages,
+            "presencePending": PRESENCE_UPDATE_HANDLE is not None,
+        })
+
+
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
         self.write("OK")
@@ -1396,6 +1447,7 @@ def make_app():
         (r"/axxum/poll$", AxxumPollHandler),
         (r"/axxum/send$", AxxumSendHandler),
         (r"/axxum/disconnect$", AxxumDisconnectHandler),
+        (r"/stats$", StatsHandler),
         (r"/healthz$", HealthHandler),
     ])
 

@@ -76,6 +76,16 @@ def normalize_chat_color(value, default="78AAFF"):
         return text
     return default
 
+def normalize_optional_chat_color(value):
+    if value is None:
+        return None
+    text = sanitize_text(value or "", 16).strip().lstrip("#").upper()
+    if not text:
+        return None
+    if len(text) == 6 and all(ch in "0123456789ABCDEF" for ch in text):
+        return text
+    return None
+
 ADMIN_SECRET = os.environ.get("ADMIN_KEY", "").strip()
 
 def coerce_user_id(v):
@@ -160,6 +170,7 @@ def get_user_list():
                 "userId": d.get("user_id"),
                 "admin": bool(d.get("admin", False)),
                 "chatColor": normalize_chat_color(d.get("chat_color")),
+                "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
                 "game": "Game: Hidden" if activity_hidden else game_status,
                 "placeId": None if activity_hidden else d.get("place_id"),
                 "jobId": None if activity_hidden else d.get("job_id"),
@@ -182,6 +193,7 @@ def get_user_list_admin():
                 "userId": d.get("user_id"),
                 "admin": bool(d.get("admin", False)),
                 "chatColor": normalize_chat_color(d.get("chat_color")),
+                "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
                 "hidden": bool(d.get("hidden", False)),
                 "activityHidden": bool(d.get("activity_hidden", False)),
                 "game": game_status,
@@ -325,6 +337,7 @@ def _chat_payload(record, event_type="chat"):
         "admin": bool(record.get("admin", False)),
         "game": record.get("game") or "",
         "chatColor": normalize_chat_color(record.get("chat_color")),
+        "chatColor2": normalize_optional_chat_color(record.get("chat_color2")),
         "reply": record.get("reply"),
         "edited": bool(record.get("edited", False)),
         "editedAt": record.get("edited_at"),
@@ -615,7 +628,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name="", chat_color="78AAFF"):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None):
         connections[username] = self
         user_data[username] = {
             "connection": self,
@@ -632,6 +645,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "activity_hidden": bool(activity_hidden),
             "display_name": display_name or "",
             "chat_color": normalize_chat_color(chat_color),
+            "chat_color2": normalize_optional_chat_color(chat_color2),
         }
 
     def remove_user(self):
@@ -664,6 +678,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         place_id = data.get("placeId")
         job_id = data.get("jobId")
         chat_color = normalize_chat_color(data.get("chatColor"))
+        chat_color2 = normalize_optional_chat_color(data.get("chatColor2"))
+        if chat_color2 == chat_color:
+            chat_color2 = None
 
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
@@ -716,6 +733,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             activity_hidden=activity_hidden,
             display_name=display_name,
             chat_color=chat_color,
+            chat_color2=chat_color2,
         )
         schedule_presence()
 
@@ -725,6 +743,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 "username": username,
                 "displayName": display_name,
                 "chatColor": chat_color,
+                "chatColor2": chat_color2,
                 "token": "dummy_token",
                 "hidden": hidden,
                 "userId": user_id,
@@ -792,6 +811,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "admin": bool(info.get("admin", False)),
             "game": info.get("game_status") or "",
             "chat_color": normalize_chat_color(info.get("chat_color")),
+            "chat_color2": normalize_optional_chat_color(info.get("chat_color2")),
             "reply": reply,
             "edited": False,
             "edited_at": None,
@@ -921,8 +941,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Not registered")
             return
         color = normalize_chat_color(data.get("chatColor"))
+        color2 = normalize_optional_chat_color(data.get("chatColor2"))
+        if color2 == color:
+            color2 = None
         info["chat_color"] = color
-        self.send({"type": "chat_color_updated", "chatColor": color})
+        info["chat_color2"] = color2
+        self.send({"type": "chat_color_updated", "chatColor": color, "chatColor2": color2})
 
     def handle_typing(self, data):
         if not self.username:
@@ -1167,6 +1191,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "userId": info.get("user_id"),
             "admin": bool(info.get("admin", False)),
             "chatColor": normalize_chat_color(info.get("chat_color")),
+            "chatColor2": normalize_optional_chat_color(info.get("chat_color2")),
             "message": message,
         }
         payload["timestamp"] = time.time()
@@ -1176,6 +1201,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "userId": info.get("user_id"),
             "admin": bool(info.get("admin", False)),
             "chatColor": normalize_chat_color(info.get("chat_color")),
+            "chatColor2": normalize_optional_chat_color(info.get("chat_color2")),
             "message": message,
             "timestamp": payload["timestamp"],
         })

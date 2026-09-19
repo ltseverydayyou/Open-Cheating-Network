@@ -4,6 +4,7 @@ import time
 import asyncio
 import urllib.parse
 import uuid
+import hashlib
 from collections import deque
 import tornado.httpclient
 import tornado.ioloop
@@ -19,6 +20,7 @@ CONFIG = {
     "max_group_members": 50,
     "max_groups_per_user": 20,
     "max_chat_history": 1000,
+    "max_admin_dm_history": 1000,
 }
 
 ADMIN_IDS = {
@@ -43,9 +45,12 @@ http_clients = {}
 
 banned_users = set()
 muted_until = {}
+banned_hwids = set()
+known_hwids = {}
 group_chats = {}
 chat_messages = {}
 chat_message_order = deque()
+admin_dm_history = deque(maxlen=CONFIG["max_admin_dm_history"])
 STATE_FILE = os.environ.get("OCN_STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocn_state.json")).strip()
 STATE_SAVE_HANDLE = None
 
@@ -199,6 +204,7 @@ def get_user_list_admin():
                 "game": game_status,
                 "placeId": d.get("place_id"),
                 "jobId": d.get("job_id"),
+                "hwidFingerprint": (d.get("hwid") or "")[:16] or None,
             }
         )
     return result
@@ -218,6 +224,85 @@ def unban_user(username: str):
 
 def get_ban_list():
     return sorted(banned_users)
+
+def normalize_hwid(value):
+    if value is None:
+        return None
+    try:
+        raw = str(value).strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+def remember_hwid(username: str, hwid_hash):
+    if not username or not hwid_hash:
+        return False
+    key = username.lower()
+    previous = known_hwids.get(key)
+    previous_hash = previous.get("hwid") if isinstance(previous, dict) else previous
+    previous_name = previous.get("username") if isinstance(previous, dict) else None
+    changed = previous_hash != hwid_hash or previous_name != username
+    known_hwids[key] = {"username": username, "hwid": hwid_hash}
+    return changed
+
+def get_known_hwid(target: str):
+    value = sanitize_text(target or "", 128).strip()
+    if not value:
+        return None
+    lower = value.lower()
+    if len(lower) == 64 and all(ch in "0123456789abcdef" for ch in lower):
+        return lower
+    if 8 <= len(lower) < 64 and all(ch in "0123456789abcdef" for ch in lower):
+        matches = [digest for digest in banned_hwids if digest.startswith(lower)]
+        if len(matches) == 1:
+            return matches[0]
+    entry = known_hwids.get(lower)
+    if isinstance(entry, dict):
+        digest = entry.get("hwid")
+    else:
+        digest = entry
+    if isinstance(digest, str) and len(digest) == 64:
+        return digest.lower()
+    resolved = find_online_username(value)
+    if resolved:
+        info = user_data.get(resolved, {})
+        digest = info.get("hwid")
+        if isinstance(digest, str) and len(digest) == 64:
+            return digest.lower()
+    return None
+
+def is_hwid_banned(hwid_hash) -> bool:
+    return bool(hwid_hash and hwid_hash in banned_hwids)
+
+def get_hwid_ban_list():
+    aliases = {}
+    for entry in known_hwids.values():
+        if isinstance(entry, dict):
+            digest = entry.get("hwid")
+            username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
+        else:
+            digest = entry
+            username = ""
+        if isinstance(digest, str) and digest in banned_hwids and username:
+            aliases.setdefault(digest, []).append(username)
+    out = []
+    for digest in sorted(banned_hwids):
+        users = sorted(set(aliases.get(digest, [])), key=str.lower)
+        out.append({
+            "fingerprint": digest[:16],
+            "users": users,
+        })
+    return out
+
+def get_admin_state():
+    return {
+        "type": "admin_state",
+        "banned": get_ban_list(),
+        "muted": get_mute_list(),
+        "hwidBanned": get_hwid_ban_list(),
+    }
 
 def get_mute_info(username: str):
     if not username:
@@ -280,6 +365,18 @@ def broadcast(obj, exclude=None):
             continue
         try:
             ws.write_message(msg)
+        except Exception:
+            pass
+
+def broadcast_admin(obj):
+    payload = dict(obj)
+    payload.setdefault("timestamp", time.time())
+    for name, ws in list(connections.items()):
+        info = user_data.get(name) or {}
+        if info.get("connection") is not ws or not info.get("admin"):
+            continue
+        try:
+            ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -409,10 +506,25 @@ def _serialize_state():
         if record and not record.get("deleted"):
             history.append(record)
 
+    known = []
+    for entry in known_hwids.values():
+        if isinstance(entry, dict):
+            username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
+            digest = entry.get("hwid")
+        else:
+            username = ""
+            digest = entry
+        if username and isinstance(digest, str) and len(digest) == 64:
+            known.append({"username": username, "hwid": digest})
+
     return {
-        "version": 1,
+        "version": 2,
         "groups": groups,
         "chat_messages": history,
+        "banned_users": get_ban_list(),
+        "muted": get_mute_list(),
+        "banned_hwids": sorted(banned_hwids),
+        "known_hwids": known,
     }
 
 def _save_state_now():
@@ -454,6 +566,47 @@ def _load_state():
     except Exception as exc:
         print("state load failed:", exc)
         return
+
+    loaded_banned = payload.get("banned_users") if isinstance(payload, dict) else None
+    if isinstance(loaded_banned, list):
+        for item in loaded_banned:
+            username = sanitize_text(item or "", CONFIG["max_username_length"]).strip().lower()
+            if username:
+                banned_users.add(username)
+
+    loaded_muted = payload.get("muted") if isinstance(payload, dict) else None
+    if isinstance(loaded_muted, list):
+        now = time.time()
+        for item in loaded_muted:
+            if not isinstance(item, dict):
+                continue
+            username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip().lower()
+            try:
+                until = float(item.get("until"))
+            except Exception:
+                continue
+            if username and until > now:
+                muted_until[username] = {
+                    "until": until,
+                    "reason": sanitize_text(item.get("reason") or "", 200),
+                }
+
+    loaded_hwid_bans = payload.get("banned_hwids") if isinstance(payload, dict) else None
+    if isinstance(loaded_hwid_bans, list):
+        for item in loaded_hwid_bans:
+            digest = sanitize_text(item or "", 64).strip().lower()
+            if len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
+                banned_hwids.add(digest)
+
+    loaded_known_hwids = payload.get("known_hwids") if isinstance(payload, dict) else None
+    if isinstance(loaded_known_hwids, list):
+        for item in loaded_known_hwids:
+            if not isinstance(item, dict):
+                continue
+            username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip()
+            digest = sanitize_text(item.get("hwid") or "", 64).strip().lower()
+            if username and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
+                known_hwids[username.lower()] = {"username": username, "hwid": digest}
 
     loaded_groups = payload.get("groups") if isinstance(payload, dict) else None
     if isinstance(loaded_groups, list):
@@ -628,7 +781,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None):
         connections[username] = self
         user_data[username] = {
             "connection": self,
@@ -646,6 +799,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "display_name": display_name or "",
             "chat_color": normalize_chat_color(chat_color),
             "chat_color2": normalize_optional_chat_color(chat_color2),
+            "hwid": hwid_hash,
         }
 
     def remove_user(self):
@@ -681,6 +835,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         chat_color2 = normalize_optional_chat_color(data.get("chatColor2"))
         if chat_color2 == chat_color:
             chat_color2 = None
+        hwid_hash = normalize_hwid(data.get("hwid"))
 
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
@@ -709,6 +864,17 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 pass
             return
 
+        if is_hwid_banned(hwid_hash):
+            self.send_error_msg("This device is HWID banned from NA Chat", code="hwid_banned")
+            try:
+                self.close(4003, "HWID banned from NA Chat")
+            except Exception:
+                pass
+            return
+
+        if hwid_hash and remember_hwid(username, hwid_hash):
+            schedule_state_save()
+
         if username in connections and connections[username] is not self:
             existing = user_data.get(username, {})
             if existing.get("user_id") != user_id:
@@ -734,6 +900,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             display_name=display_name,
             chat_color=chat_color,
             chat_color2=chat_color2,
+            hwid_hash=hwid_hash,
         )
         schedule_presence()
 
@@ -759,6 +926,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         self.send({"type": "user_list", "users": get_user_list()})
         if is_admin:
             self.send({"type": "user_list_admin", "users": get_user_list_admin()})
+            self.send(get_admin_state())
+            self.send({"type": "admin_dm_history", "messages": list(admin_dm_history)})
         self.send({"type": "group_list", "groups": groups_for_user(username)})
         for group in pending_groups_for_user(username):
             self.send({"type": "group_invite", "group": group})
@@ -1002,10 +1171,22 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Cannot send private message to yourself")
             return
 
-        payload = {"type": "private_chat", "from": self.username, "to": target, "message": message}
+        resolved_target = find_online_username(target) or target
+        stamp = time.time()
+        payload = {"type": "private_chat", "from": self.username, "to": resolved_target, "message": message, "timestamp": stamp}
         send_to_user(self.username, payload)
-        if not send_to_user(target, payload):
+        if not send_to_user(resolved_target, payload):
             self.send_error_msg(f"User '{target}' is not online")
+            return
+
+        audit = {
+            "from": self.username,
+            "to": resolved_target,
+            "message": message,
+            "timestamp": stamp,
+        }
+        admin_dm_history.append(audit)
+        broadcast_admin({"type": "admin_dm", **audit})
 
     def handle_group_list(self):
         if not self.username:
@@ -1355,16 +1536,19 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Missing action")
             return
 
-        if action in ("kick", "ban", "unban", "mute", "unmute") and not target:
+        if action in ("kick", "ban", "unban", "mute", "unmute", "hwid_ban", "unhwid_ban") and not target:
             self.send_error_msg("Missing target")
             return
 
-        if target == self.username and action in ("ban", "kick"):
+        resolved_target = find_online_username(target) or target
+        if resolved_target.lower() == self.username.lower() and action in ("ban", "kick", "hwid_ban"):
             self.send_error_msg("You cannot target yourself")
             return
 
+        state_changed = False
+
         if action == "kick":
-            ws = connections.get(target)
+            ws = connections.get(resolved_target)
             if not ws:
                 self.send_error_msg("Target not found")
             else:
@@ -1372,34 +1556,92 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     ws.close(4000, "Kicked from NA Chat")
                 except Exception:
                     pass
-                broadcast({"type": "system", "message": f"{target} was kicked from NA Chat"})
+                broadcast({"type": "system", "message": f"{resolved_target} was kicked from NA Chat"})
 
         elif action == "ban":
-            ban_user(target)
-            ws = connections.get(target)
+            ban_user(resolved_target)
+            state_changed = True
+            ws = connections.get(resolved_target)
             if ws:
                 try:
                     ws.close(4001, "Banned from NA Chat")
                 except Exception:
                     pass
-            broadcast({"type": "system", "message": f"{target} was banned from NA Chat"})
+            broadcast({"type": "system", "message": f"{resolved_target} was banned from NA Chat"})
 
         elif action == "unban":
             unban_user(target)
+            state_changed = True
             self.send({"type": "system", "message": f"{target} was unbanned from NA Chat"})
 
         elif action == "mute":
-            if not duration:
-                duration = 300
+            try:
+                duration = float(duration or 300)
+            except Exception:
+                duration = 300.0
+            if duration <= 0:
+                duration = 300.0
             raw_reason = (data.get("reason") or "").strip()
             reason = sanitize_text(raw_reason, 200)
-            mute_user(target, duration, reason=reason)
+            mute_user(resolved_target, duration, reason=reason)
+            state_changed = True
             reason_suffix = f" - {reason}" if reason else ""
-            broadcast({"type": "system", "message": f"{target} was muted in NA Chat ({int(duration)}s){reason_suffix}"})
+            broadcast({"type": "system", "message": f"{resolved_target} was muted in NA Chat ({int(duration)}s){reason_suffix}"})
 
         elif action == "unmute":
             unmute_user(target)
+            state_changed = True
             broadcast({"type": "system", "message": f"{target} was unmuted in NA Chat"})
+
+        elif action == "hwid_ban":
+            digest = get_known_hwid(resolved_target)
+            if not digest:
+                self.send_error_msg("No HWID is available for that user; their executor may not expose gethwid()", code="hwid_unavailable")
+                return
+            banned_hwids.add(digest)
+            state_changed = True
+            ws = connections.get(resolved_target)
+            if ws:
+                try:
+                    ws.close(4003, "HWID banned from NA Chat")
+                except Exception:
+                    pass
+            broadcast({"type": "system", "message": f"{resolved_target} was HWID banned from NA Chat"})
+
+        elif action == "unhwid_ban":
+            digest = get_known_hwid(target)
+            if not digest or digest not in banned_hwids:
+                self.send_error_msg("HWID ban not found", code="hwid_ban_not_found")
+                return
+            banned_hwids.discard(digest)
+            state_changed = True
+            self.send({"type": "system", "message": f"HWID ban removed for {target}"})
+
+        elif action == "purge":
+            try:
+                count = int(data.get("count") or duration or 1)
+            except Exception:
+                count = 1
+            count = max(1, min(CONFIG["max_chat_history"], count))
+            purged = []
+            for message_id in reversed(chat_message_order):
+                record = chat_messages.get(message_id)
+                if not record or record.get("deleted"):
+                    continue
+                record["deleted"] = True
+                record["deleted_at"] = time.time()
+                purged.append(message_id)
+                if len(purged) >= count:
+                    break
+            if purged:
+                broadcast({
+                    "type": "messages_purged",
+                    "messageIds": purged,
+                    "count": len(purged),
+                    "by": self.username,
+                })
+                schedule_state_save()
+            self.send({"type": "system", "message": f"Purged {len(purged)} chat message(s)"})
 
         elif action == "refresh":
             pass
@@ -1407,7 +1649,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Unknown admin action")
             return
 
-        self.send({"type": "admin_state", "banned": get_ban_list(), "muted": get_mute_list()})
+        if state_changed:
+            schedule_state_save()
+            broadcast_admin(get_admin_state())
+        else:
+            self.send(get_admin_state())
 
 
 async def dispatch_message(client, data):

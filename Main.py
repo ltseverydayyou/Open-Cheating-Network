@@ -5,6 +5,7 @@ import asyncio
 import urllib.parse
 import uuid
 import hashlib
+import unicodedata
 from collections import deque
 import tornado.httpclient
 import tornado.ioloop
@@ -74,6 +75,57 @@ def sanitize_text(s, max_len=None):
     if max_len is not None and len(cleaned) > max_len:
         cleaned = cleaned[:max_len]
     return cleaned
+
+_q0 = 7
+_q1 = (
+    (117,112,110,110,108,121),(117,112,110,110,104),(109,104,110,110,118,123),
+    (114,112,114,108),(106,111,112,117,114),(122,119,112,106),(126,108,123,105,104,106,114),
+    (110,118,118,114),(123,121,104,117,117,128),(106,118,118,117),
+    (117,110,110,104),(117,112,120,120,104),(117,120,120,104),
+)
+_q2 = (
+    (107,112,107,107,128),(107,112,107,128),(107,112,107,107,112,117,110),(107,112,107,107,128,112,117,110),
+    (119,108,107,118,119,111,112,115,108),(119,108,107,118,119,111,112,115,112,104),
+    (119,108,107,118,119,111,112,115,112,106),(119,108,107,118),
+    (108,119,122,123,108,112,117),(119,107,109),
+)
+_q3 = {"0":"o","1":"i","2":"z","3":"e","4":"a","5":"s","6":"g","7":"t","8":"b","9":"g","$":"s","@":"a","€":"e","£":"l"}
+
+def _q4(items):
+    return tuple("".join(chr(value - _q0) for value in row) for row in items)
+
+_q5 = _q4(_q1)
+_q6 = _q4(_q2)
+
+def _q7(value):
+    text = unicodedata.normalize("NFKD", sanitize_text(value or "", CONFIG["max_message_length"])).casefold()
+    out = []
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        mapped = _q3.get(ch, ch)
+        if mapped.isalpha():
+            out.append(mapped)
+    return "".join(out)
+
+def _q8(value):
+    normalized = _q7(value)
+    if not normalized:
+        return None
+    if any(term in normalized for term in _q5):
+        return 1
+    if any(term in normalized for term in _q6):
+        return 2
+    return None
+
+def _q9(handler, value):
+    reason = _q8(value)
+    if reason == 1:
+        handler.send_error_msg("Message blocked by NA Chat moderation", code="message_blocked")
+        return False
+    if reason == 2:
+        return False
+    return True
 
 def normalize_chat_color(value, default="78AAFF"):
     text = sanitize_text(value or "", 16).strip().lstrip("#").upper()
@@ -959,6 +1011,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not msg:
             self.send_error_msg("Message cannot be empty")
             return
+        if not _q9(self, msg):
+            return
 
         reply = None
         reply_id = sanitize_text(data.get("replyTo") or "", 64).strip()
@@ -1011,6 +1065,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
             self.send_error_msg("Message cannot be empty")
+            return
+        if not _q9(self, message):
             return
         record["message"] = message
         record["edited"] = True
@@ -1160,6 +1216,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         if not message:
             self.send_error_msg("Message cannot be empty")
+            return
+        if not _q9(self, message):
             return
         if len(message) > CONFIG["max_message_length"]:
             self.send_error_msg("Message too long")
@@ -1361,6 +1419,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         message = sanitize_text((data.get("message") or "").strip(), CONFIG["max_message_length"])
         if not message:
             self.send_error_msg("Message cannot be empty")
+            return
+        if not _q9(self, message):
             return
         info = user_data.get(self.username, {})
         payload = {

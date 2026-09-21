@@ -22,7 +22,6 @@ CONFIG = {
     "max_groups_per_user": 20,
     "max_chat_history": 1000,
     "max_admin_dm_history": 1000,
-    "strict_identity_presence": os.environ.get("OCN_STRICT_IDENTITY", "1").strip().lower() not in ("0", "false", "no", "off"),
 }
 
 ADMIN_IDS = {
@@ -245,32 +244,6 @@ async def fetch_roblox_user_by_name(username: str):
             pass
     return None, None, None
 
-async def fetch_roblox_presence(user_id: int):
-    url = "https://presence.roblox.com/v1/presence/users"
-    body = json.dumps({"userIds": [int(user_id)]}).encode("utf-8")
-    http_client = tornado.httpclient.AsyncHTTPClient()
-    for api_url in roblox_api_urls(url):
-        try:
-            request = tornado.httpclient.HTTPRequest(
-                api_url,
-                method="POST",
-                body=body,
-                connect_timeout=2.0,
-                request_timeout=4.0,
-                headers={"User-Agent": "NA-Chat/1.0", "Content-Type": "application/json"},
-            )
-            response = await http_client.fetch(request, raise_error=False)
-            if response.code != 200:
-                continue
-            payload = json.loads(response.body.decode("utf-8", errors="ignore"))
-            rows = payload.get("userPresences") if isinstance(payload, dict) else None
-            if isinstance(rows, list):
-                for item in rows:
-                    if isinstance(item, dict) and coerce_user_id(item.get("userId")) == int(user_id):
-                        return item
-        except Exception:
-            pass
-    return None
 
 def get_presented_identity(username, info):
     info = info if isinstance(info, dict) else {}
@@ -393,40 +366,11 @@ def get_hwid_identity_binding(hwid_hash):
             }
     return None
 
-async def verify_registration_identity(user_id, place_id, job_id, hwid_hash):
+async def verify_registration_identity(user_id, hwid_hash):
     binding = get_hwid_identity_binding(hwid_hash)
-    if binding:
-        if binding["user_id"] != int(user_id):
-            return False, "This device is already bound to a different Roblox account"
-        return True, "device_binding"
-
-    if not CONFIG.get("strict_identity_presence", True):
-        return True, "strict_check_disabled"
-
-    try:
-        claimed_place = int(place_id)
-    except Exception:
-        return False, "Missing/invalid placeId for identity verification"
-    claimed_job = sanitize_text(job_id or "", 128).strip().lower()
-    if claimed_place <= 0 or not claimed_job:
-        return False, "Missing game server identity for Roblox account verification"
-
-    presence = await fetch_roblox_presence(int(user_id))
-    if not isinstance(presence, dict):
-        return False, "Could not verify Roblox account presence"
-    if int(presence.get("userPresenceType") or 0) != 2:
-        return False, "Roblox account is not reported in-game"
-
-    try:
-        presence_place = int(presence.get("placeId") or 0)
-    except Exception:
-        presence_place = 0
-    presence_job = sanitize_text(presence.get("gameId") or "", 128).strip().lower()
-    if presence_place != claimed_place:
-        return False, "Roblox account is not in this place"
-    if not presence_job or presence_job != claimed_job:
-        return False, "Roblox account is not in this game server"
-    return True, "presence"
+    if binding and binding["user_id"] != int(user_id):
+        return False, "This device is already bound to a different Roblox account"
+    return True, "device_binding" if binding else "roblox_profile"
 
 def get_known_hwid(target: str):
     value = sanitize_text(target or "", 128).strip()
@@ -1051,7 +995,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         username = rb_name
         display_name = rb_display or ""
 
-        identity_ok, identity_detail = await verify_registration_identity(user_id, place_id, job_id, hwid_hash)
+        identity_ok, identity_detail = await verify_registration_identity(user_id, hwid_hash)
         if not identity_ok:
             self.send_error_msg(identity_detail, code="identity_verification_failed")
             try:

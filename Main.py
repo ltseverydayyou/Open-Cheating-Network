@@ -366,7 +366,35 @@ def get_hwid_identity_binding(hwid_hash):
             }
     return None
 
-async def verify_registration_identity(user_id, hwid_hash):
+def character_appearance_user_id(value):
+    text = sanitize_text(value or "", 1024).strip()
+    if not text:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        query = urllib.parse.parse_qs(parsed.query)
+    except Exception:
+        return None
+    for key, values in query.items():
+        if str(key).lower() != "userid" or not isinstance(values, list):
+            continue
+        for item in values:
+            user_id = coerce_user_id(item)
+            if user_id and user_id > 0:
+                return user_id
+    return None
+
+async def verify_registration_identity(user_id, hwid_hash, character_appearance_id, character_appearance):
+    appearance_id = coerce_user_id(character_appearance_id)
+    appearance_url_user_id = character_appearance_user_id(character_appearance)
+
+    if not appearance_id or appearance_id <= 0:
+        return False, "Missing/invalid CharacterAppearanceId"
+    if not appearance_url_user_id or appearance_url_user_id <= 0:
+        return False, "Missing/invalid CharacterAppearance userId"
+    if int(user_id) != appearance_id or int(user_id) != appearance_url_user_id or appearance_id != appearance_url_user_id:
+        return False, "Roblox identity properties do not match"
+
     binding = get_hwid_identity_binding(hwid_hash)
     if binding and binding["user_id"] != int(user_id):
         return False, "This device is already bound to a different Roblox account"
@@ -969,6 +997,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         hidden = bool(data.get("hidden", False))
         user_id = coerce_user_id(data.get("userId"))
+        character_appearance_id = data.get("characterAppearanceId")
+        character_appearance = data.get("characterAppearance")
         activity_hidden = bool(data.get("activityHidden", False) or data.get("activity_hidden", False))
         raw_game = (data.get("game") or "").strip()
         place_id = data.get("placeId")
@@ -995,7 +1025,12 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         username = rb_name
         display_name = rb_display or ""
 
-        identity_ok, identity_detail = await verify_registration_identity(user_id, hwid_hash)
+        identity_ok, identity_detail = await verify_registration_identity(
+            user_id,
+            hwid_hash,
+            character_appearance_id,
+            character_appearance,
+        )
         if not identity_ok:
             self.send_error_msg(identity_detail, code="identity_verification_failed")
             try:

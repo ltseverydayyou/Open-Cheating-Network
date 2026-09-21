@@ -22,6 +22,7 @@ CONFIG = {
     "max_groups_per_user": 20,
     "max_chat_history": 1000,
     "max_admin_dm_history": 1000,
+    "strict_identity_presence": os.environ.get("OCN_STRICT_IDENTITY", "1").strip().lower() not in ("0", "false", "no", "off"),
 }
 
 ADMIN_IDS = {
@@ -209,6 +210,82 @@ async def fetch_roblox_user(user_id: int):
 
     return None, None
 
+async def fetch_roblox_user_by_name(username: str):
+    query = sanitize_text(username or "", CONFIG["max_username_length"]).strip()
+    if not query:
+        return None, None, None
+    url = "https://users.roblox.com/v1/usernames/users"
+    body = json.dumps({"usernames": [query], "excludeBannedUsers": False}).encode("utf-8")
+    http_client = tornado.httpclient.AsyncHTTPClient()
+    for api_url in roblox_api_urls(url):
+        try:
+            request = tornado.httpclient.HTTPRequest(
+                api_url,
+                method="POST",
+                body=body,
+                connect_timeout=2.0,
+                request_timeout=4.0,
+                headers={"User-Agent": "NA-Chat/1.0", "Content-Type": "application/json"},
+            )
+            response = await http_client.fetch(request, raise_error=False)
+            if response.code != 200:
+                continue
+            payload = json.loads(response.body.decode("utf-8", errors="ignore"))
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or not rows:
+                continue
+            item = rows[0] if isinstance(rows[0], dict) else {}
+            user_id = coerce_user_id(item.get("id"))
+            name = sanitize_text(item.get("name") or "", CONFIG["max_username_length"]).strip()
+            display = sanitize_text(item.get("displayName") or "", CONFIG["max_username_length"]).strip()
+            if user_id and name:
+                ROBLOX_USER_CACHE[user_id] = {"ts": time.time(), "name": name, "displayName": display}
+                return user_id, name, display
+        except Exception:
+            pass
+    return None, None, None
+
+async def fetch_roblox_presence(user_id: int):
+    url = "https://presence.roblox.com/v1/presence/users"
+    body = json.dumps({"userIds": [int(user_id)]}).encode("utf-8")
+    http_client = tornado.httpclient.AsyncHTTPClient()
+    for api_url in roblox_api_urls(url):
+        try:
+            request = tornado.httpclient.HTTPRequest(
+                api_url,
+                method="POST",
+                body=body,
+                connect_timeout=2.0,
+                request_timeout=4.0,
+                headers={"User-Agent": "NA-Chat/1.0", "Content-Type": "application/json"},
+            )
+            response = await http_client.fetch(request, raise_error=False)
+            if response.code != 200:
+                continue
+            payload = json.loads(response.body.decode("utf-8", errors="ignore"))
+            rows = payload.get("userPresences") if isinstance(payload, dict) else None
+            if isinstance(rows, list):
+                for item in rows:
+                    if isinstance(item, dict) and coerce_user_id(item.get("userId")) == int(user_id):
+                        return item
+        except Exception:
+            pass
+    return None
+
+def get_presented_identity(username, info):
+    info = info if isinstance(info, dict) else {}
+    if info.get("admin") and info.get("appearance_username"):
+        return (
+            sanitize_text(info.get("appearance_username") or username, CONFIG["max_username_length"]),
+            sanitize_text(info.get("appearance_display_name") or "", CONFIG["max_username_length"]),
+            coerce_user_id(info.get("appearance_user_id")) or info.get("user_id"),
+        )
+    return (
+        sanitize_text(username or info.get("username") or "", CONFIG["max_username_length"]),
+        sanitize_text(info.get("display_name") or "", CONFIG["max_username_length"]),
+        info.get("user_id"),
+    )
+
 def get_user_list():
     result = []
     for u, d in user_data.items():
@@ -217,14 +294,13 @@ def get_user_list():
         if d.get("hidden", False):
             continue
         activity_hidden = bool(d.get("activity_hidden", False))
-        username = sanitize_text(u, CONFIG["max_username_length"])
-        display_name = sanitize_text(d.get("display_name") or "", CONFIG["max_username_length"])
+        username, display_name, presented_user_id = get_presented_identity(u, d)
         game_status = sanitize_text(d.get("game_status") or "", CONFIG["max_game_name_length"])
         result.append(
             {
                 "username": username,
                 "displayName": display_name,
-                "userId": d.get("user_id"),
+                "userId": presented_user_id,
                 "admin": bool(d.get("admin", False)),
                 "chatColor": normalize_chat_color(d.get("chat_color")),
                 "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
@@ -240,14 +316,16 @@ def get_user_list_admin():
     for u, d in user_data.items():
         if connections.get(u) is not d.get("connection"):
             continue
-        username = sanitize_text(u, CONFIG["max_username_length"])
-        display_name = sanitize_text(d.get("display_name") or "", CONFIG["max_username_length"])
+        username, display_name, presented_user_id = get_presented_identity(u, d)
         game_status = sanitize_text(d.get("game_status") or "", CONFIG["max_game_name_length"])
         result.append(
             {
                 "username": username,
                 "displayName": display_name,
-                "userId": d.get("user_id"),
+                "userId": presented_user_id,
+                "canonicalUsername": sanitize_text(u, CONFIG["max_username_length"]),
+                "canonicalUserId": d.get("user_id"),
+                "disguised": bool(d.get("admin") and d.get("appearance_username")),
                 "admin": bool(d.get("admin", False)),
                 "chatColor": normalize_chat_color(d.get("chat_color")),
                 "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
@@ -288,16 +366,67 @@ def normalize_hwid(value):
         return None
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-def remember_hwid(username: str, hwid_hash):
+def remember_hwid(username: str, hwid_hash, user_id=None):
     if not username or not hwid_hash:
         return False
     key = username.lower()
     previous = known_hwids.get(key)
     previous_hash = previous.get("hwid") if isinstance(previous, dict) else previous
     previous_name = previous.get("username") if isinstance(previous, dict) else None
-    changed = previous_hash != hwid_hash or previous_name != username
-    known_hwids[key] = {"username": username, "hwid": hwid_hash}
+    previous_user_id = coerce_user_id(previous.get("user_id")) if isinstance(previous, dict) else None
+    normalized_user_id = coerce_user_id(user_id)
+    changed = previous_hash != hwid_hash or previous_name != username or previous_user_id != normalized_user_id
+    known_hwids[key] = {"username": username, "hwid": hwid_hash, "user_id": normalized_user_id}
     return changed
+
+def get_hwid_identity_binding(hwid_hash):
+    if not hwid_hash:
+        return None
+    for entry in known_hwids.values():
+        if not isinstance(entry, dict) or entry.get("hwid") != hwid_hash:
+            continue
+        user_id = coerce_user_id(entry.get("user_id"))
+        if user_id:
+            return {
+                "username": sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]),
+                "user_id": user_id,
+            }
+    return None
+
+async def verify_registration_identity(user_id, place_id, job_id, hwid_hash):
+    binding = get_hwid_identity_binding(hwid_hash)
+    if binding:
+        if binding["user_id"] != int(user_id):
+            return False, "This device is already bound to a different Roblox account"
+        return True, "device_binding"
+
+    if not CONFIG.get("strict_identity_presence", True):
+        return True, "strict_check_disabled"
+
+    try:
+        claimed_place = int(place_id)
+    except Exception:
+        return False, "Missing/invalid placeId for identity verification"
+    claimed_job = sanitize_text(job_id or "", 128).strip().lower()
+    if claimed_place <= 0 or not claimed_job:
+        return False, "Missing game server identity for Roblox account verification"
+
+    presence = await fetch_roblox_presence(int(user_id))
+    if not isinstance(presence, dict):
+        return False, "Could not verify Roblox account presence"
+    if int(presence.get("userPresenceType") or 0) != 2:
+        return False, "Roblox account is not reported in-game"
+
+    try:
+        presence_place = int(presence.get("placeId") or 0)
+    except Exception:
+        presence_place = 0
+    presence_job = sanitize_text(presence.get("gameId") or "", 128).strip().lower()
+    if presence_place != claimed_place:
+        return False, "Roblox account is not in this place"
+    if not presence_job or presence_job != claimed_job:
+        return False, "Roblox account is not in this game server"
+    return True, "presence"
 
 def get_known_hwid(target: str):
     value = sanitize_text(target or "", 128).strip()
@@ -452,7 +581,14 @@ def find_online_username(target):
         return None
     value_lower = value.lower()
     for name, info in user_data.items():
-        if name.lower() == value_lower or str(info.get("user_id")) == value:
+        appearance_name = sanitize_text(info.get("appearance_username") or "", CONFIG["max_username_length"]).strip().lower()
+        appearance_user_id = coerce_user_id(info.get("appearance_user_id"))
+        if (
+            name.lower() == value_lower
+            or str(info.get("user_id")) == value
+            or (appearance_name and appearance_name == value_lower)
+            or (appearance_user_id and str(appearance_user_id) == value)
+        ):
             return name
     return None
 
@@ -483,6 +619,8 @@ def _chat_payload(record, event_type="chat"):
         "message": record.get("message") or "",
         "timestamp": record.get("timestamp"),
         "userId": record.get("user_id"),
+        "authorUsername": record.get("author_username", record.get("username")),
+        "authorUserId": record.get("author_user_id", record.get("user_id")),
         "admin": bool(record.get("admin", False)),
         "game": record.get("game") or "",
         "chatColor": normalize_chat_color(record.get("chat_color")),
@@ -495,7 +633,9 @@ def _chat_payload(record, event_type="chat"):
 def _chat_record_owned_by(record, info):
     if not isinstance(record, dict) or not isinstance(info, dict):
         return False
-    return record.get("user_id") == info.get("user_id") and record.get("username") == info.get("username")
+    author_user_id = record.get("author_user_id", record.get("user_id"))
+    author_username = record.get("author_username", record.get("username"))
+    return author_user_id == info.get("user_id") and author_username == info.get("username")
 
 def _chat_record_can_modify(record, info):
     if not isinstance(record, dict) or not isinstance(info, dict):
@@ -563,11 +703,13 @@ def _serialize_state():
         if isinstance(entry, dict):
             username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
             digest = entry.get("hwid")
+            user_id = coerce_user_id(entry.get("user_id"))
         else:
             username = ""
             digest = entry
+            user_id = None
         if username and isinstance(digest, str) and len(digest) == 64:
-            known.append({"username": username, "hwid": digest})
+            known.append({"username": username, "hwid": digest, "user_id": user_id})
 
     return {
         "version": 2,
@@ -657,8 +799,9 @@ def _load_state():
                 continue
             username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip()
             digest = sanitize_text(item.get("hwid") or "", 64).strip().lower()
+            user_id = coerce_user_id(item.get("user_id"))
             if username and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
-                known_hwids[username.lower()] = {"username": username, "hwid": digest}
+                known_hwids[username.lower()] = {"username": username, "hwid": digest, "user_id": user_id}
 
     loaded_groups = payload.get("groups") if isinstance(payload, dict) else None
     if isinstance(loaded_groups, list):
@@ -849,6 +992,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "job_id": job_id,
             "activity_hidden": bool(activity_hidden),
             "display_name": display_name or "",
+            "appearance_username": None,
+            "appearance_display_name": None,
+            "appearance_user_id": None,
             "chat_color": normalize_chat_color(chat_color),
             "chat_color2": normalize_optional_chat_color(chat_color2),
             "hwid": hwid_hash,
@@ -905,6 +1051,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         username = rb_name
         display_name = rb_display or ""
 
+        identity_ok, identity_detail = await verify_registration_identity(user_id, place_id, job_id, hwid_hash)
+        if not identity_ok:
+            self.send_error_msg(identity_detail, code="identity_verification_failed")
+            try:
+                self.close(4003, "Roblox identity verification failed")
+            except Exception:
+                pass
+            return
+
         if len(username) > CONFIG["max_username_length"]:
             username = username[: CONFIG["max_username_length"]]
 
@@ -924,7 +1079,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 pass
             return
 
-        if hwid_hash and remember_hwid(username, hwid_hash):
+        if hwid_hash and remember_hwid(username, hwid_hash, user_id):
             schedule_state_save()
 
         if username in connections and connections[username] is not self:
@@ -1024,13 +1179,16 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         now = time.time()
         message_id = uuid.uuid4().hex[:20]
+        presented_username, presented_display_name, presented_user_id = get_presented_identity(self.username, info)
         record = {
             "message_id": message_id,
-            "username": self.username,
-            "display_name": info.get("display_name") or "",
+            "username": presented_username,
+            "display_name": presented_display_name,
+            "author_username": self.username,
+            "author_user_id": info.get("user_id"),
             "message": msg,
             "timestamp": now,
-            "user_id": info.get("user_id"),
+            "user_id": presented_user_id,
             "admin": bool(info.get("admin", False)),
             "game": info.get("game_status") or "",
             "chat_color": normalize_chat_color(info.get("chat_color")),
@@ -1423,13 +1581,16 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not _q9(self, message):
             return
         info = user_data.get(self.username, {})
+        presented_username, presented_display_name, presented_user_id = get_presented_identity(self.username, info)
         payload = {
             "type": "group_message",
             "groupId": group["id"],
             "groupName": group["name"],
-            "from": self.username,
-            "displayName": info.get("display_name") or "",
-            "userId": info.get("user_id"),
+            "from": presented_username,
+            "displayName": presented_display_name,
+            "userId": presented_user_id,
+            "authorUsername": self.username,
+            "authorUserId": info.get("user_id"),
             "admin": bool(info.get("admin", False)),
             "chatColor": normalize_chat_color(info.get("chat_color")),
             "chatColor2": normalize_optional_chat_color(info.get("chat_color2")),
@@ -1437,9 +1598,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         }
         payload["timestamp"] = time.time()
         group["messages"].append({
-            "from": self.username,
-            "displayName": info.get("display_name") or "",
-            "userId": info.get("user_id"),
+            "from": presented_username,
+            "displayName": presented_display_name,
+            "userId": presented_user_id,
+            "authorUsername": self.username,
+            "authorUserId": info.get("user_id"),
             "admin": bool(info.get("admin", False)),
             "chatColor": normalize_chat_color(info.get("chat_color")),
             "chatColor2": normalize_optional_chat_color(info.get("chat_color2")),
@@ -1520,7 +1683,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not message:
             self.send_error_msg("Message cannot be empty")
             return
-        broadcast({"type": "announcement", "from": self.username, "message": message})
+        anonymous = bool(data.get("anonymous", False))
+        broadcast({"type": "announcement", "from": "Admin" if anonymous else self.username, "message": message, "anonymous": anonymous})
 
     def handle_notify(self, data):
         if not self.username:
@@ -1544,7 +1708,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if duration > 30:
             duration = 30.0
         target = data.get("target")
-        payload = {"type": "notify", "from": self.username, "message": message, "duration": duration}
+        anonymous = bool(data.get("anonymous", False))
+        payload = {"type": "notify", "from": "Admin" if anonymous else self.username, "message": message, "duration": duration, "anonymous": anonymous}
         self._send_targeted_by_user_id(payload, target)
 
     def handle_notify2(self, data):
@@ -1560,7 +1725,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Message cannot be empty")
             return
         target = data.get("target")
-        payload = {"type": "notify2", "from": self.username, "message": message}
+        anonymous = bool(data.get("anonymous", False))
+        payload = {"type": "notify2", "from": "Admin" if anonymous else self.username, "message": message, "anonymous": anonymous}
         self._send_targeted_by_user_id(payload, target)
 
     def handle_notify3(self, data):
@@ -1576,8 +1742,53 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             self.send_error_msg("Message cannot be empty")
             return
         target = data.get("target")
-        payload = {"type": "notify3", "from": self.username, "message": message}
+        anonymous = bool(data.get("anonymous", False))
+        payload = {"type": "notify3", "from": "Admin" if anonymous else self.username, "message": message, "anonymous": anonymous}
         self._send_targeted_by_user_id(payload, target)
+
+    async def handle_admin_disguise(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        query = sanitize_text(data.get("username") or data.get("target") or "", CONFIG["max_username_length"]).strip()
+        if not query:
+            self.send_error_msg("Missing Roblox username")
+            return
+
+        if query.lower() in ("off", "none", "reset", "clear"):
+            info["appearance_username"] = None
+            info["appearance_display_name"] = None
+            info["appearance_user_id"] = None
+            self.send({"type": "admin_disguise_updated", "enabled": False})
+            schedule_presence()
+            return
+
+        target_user_id, target_name, target_display = await fetch_roblox_user_by_name(query)
+        if not target_user_id or not target_name:
+            self.send_error_msg("Roblox user not found", code="disguise_user_not_found")
+            return
+
+        online_target = find_online_username(target_name)
+        if online_target and online_target != self.username:
+            self.send_error_msg("That Roblox identity is already represented by an online NA Chat user", code="disguise_identity_in_use")
+            return
+
+        info["appearance_username"] = target_name
+        info["appearance_display_name"] = target_display or ""
+        info["appearance_user_id"] = target_user_id
+        self.send({
+            "type": "admin_disguise_updated",
+            "enabled": True,
+            "username": target_name,
+            "displayName": target_display or "",
+            "userId": target_user_id,
+        })
+        schedule_presence()
 
     def handle_admin_action(self, data):
         if not self.username:
@@ -1770,6 +1981,8 @@ async def dispatch_message(client, data):
         client.handle_notify2(data)
     elif t == "notify3":
         client.handle_notify3(data)
+    elif t == "admin_disguise":
+        await client.handle_admin_disguise(data)
     elif t == "admin_action":
         client.handle_admin_action(data)
     else:

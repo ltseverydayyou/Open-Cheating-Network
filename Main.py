@@ -16,7 +16,10 @@ CONFIG = {
     "max_username_length": 50,
     "max_message_length": 500,
     "heartbeat_timeout": 90,
-    "max_game_name_length": 80,
+    "max_game_name_length": 160,
+    "max_executor_name_length": 80,
+    "max_executor_version_length": 80,
+    "max_device_name_length": 24,
     "max_group_name_length": 50,
     "max_group_members": 50,
     "max_groups_per_user": 20,
@@ -57,6 +60,8 @@ STATE_SAVE_HANDLE = None
 
 ROBLOX_USER_CACHE = {}
 ROBLOX_USER_CACHE_TTL = 6 * 60 * 60
+ROBLOX_GAME_CACHE = {}
+ROBLOX_GAME_CACHE_TTL = 6 * 60 * 60
 PRESENCE_UPDATE_DELAY = 5.0
 PRESENCE_UPDATE_HANDLE = None
 
@@ -209,6 +214,49 @@ async def fetch_roblox_user(user_id: int):
 
     return None, None
 
+async def fetch_roblox_game(universe_id: int):
+    universe_id = coerce_user_id(universe_id)
+    if not universe_id or universe_id <= 0:
+        return None, None
+
+    now = time.time()
+    cached = ROBLOX_GAME_CACHE.get(universe_id)
+    if cached and (now - cached.get("ts", 0)) < ROBLOX_GAME_CACHE_TTL:
+        return cached.get("name"), cached.get("rootPlaceId")
+
+    url = f"https://games.roblox.com/v1/games?universeIds={int(universe_id)}"
+    http_client = tornado.httpclient.AsyncHTTPClient()
+    for api_url in roblox_api_urls(url):
+        try:
+            request = tornado.httpclient.HTTPRequest(
+                api_url,
+                method="GET",
+                connect_timeout=2.0,
+                request_timeout=4.0,
+                headers={"User-Agent": "NA-Chat/1.0"},
+            )
+            response = await http_client.fetch(request, raise_error=False)
+            if response.code != 200:
+                continue
+            payload = json.loads(response.body.decode("utf-8", errors="ignore"))
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                continue
+            item = rows[0]
+            name = sanitize_text(item.get("name") or "", CONFIG["max_game_name_length"]).strip()
+            root_place_id = coerce_user_id(item.get("rootPlaceId"))
+            if name:
+                ROBLOX_GAME_CACHE[universe_id] = {
+                    "ts": time.time(),
+                    "name": name,
+                    "rootPlaceId": root_place_id,
+                }
+                return name, root_place_id
+        except Exception:
+            pass
+
+    return None, None
+
 async def fetch_roblox_user_by_name(username: str):
     query = sanitize_text(username or "", CONFIG["max_username_length"]).strip()
     if not query:
@@ -278,8 +326,13 @@ def get_user_list():
                 "chatColor": normalize_chat_color(d.get("chat_color")),
                 "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
                 "game": "Game: Hidden" if activity_hidden else game_status,
+                "experienceName": "" if activity_hidden else sanitize_text(d.get("experience_name") or "", CONFIG["max_game_name_length"]),
+                "subplaceName": "" if activity_hidden else sanitize_text(d.get("subplace_name") or "", CONFIG["max_game_name_length"]),
                 "placeId": None if activity_hidden else d.get("place_id"),
                 "jobId": None if activity_hidden else d.get("job_id"),
+                "executor": sanitize_text(d.get("executor") or "", CONFIG["max_executor_name_length"]),
+                "executorVersion": sanitize_text(d.get("executor_version") or "", CONFIG["max_executor_version_length"]),
+                "device": sanitize_text(d.get("device") or "", CONFIG["max_device_name_length"]),
             }
         )
     return result
@@ -305,8 +358,13 @@ def get_user_list_admin():
                 "hidden": bool(d.get("hidden", False)),
                 "activityHidden": bool(d.get("activity_hidden", False)),
                 "game": game_status,
+                "experienceName": sanitize_text(d.get("experience_name") or "", CONFIG["max_game_name_length"]),
+                "subplaceName": sanitize_text(d.get("subplace_name") or "", CONFIG["max_game_name_length"]),
                 "placeId": d.get("place_id"),
                 "jobId": d.get("job_id"),
+                "executor": sanitize_text(d.get("executor") or "", CONFIG["max_executor_name_length"]),
+                "executorVersion": sanitize_text(d.get("executor_version") or "", CONFIG["max_executor_version_length"]),
+                "device": sanitize_text(d.get("device") or "", CONFIG["max_device_name_length"]),
                 "hwidFingerprint": (d.get("hwid") or "")[:16] or None,
             }
         )
@@ -396,9 +454,11 @@ async def verify_registration_identity(user_id, hwid_hash, character_appearance_
         return False, "Roblox identity properties do not match"
 
     binding = get_hwid_identity_binding(hwid_hash)
-    if binding and binding["user_id"] != int(user_id):
-        return False, "This device is already bound to a different Roblox account"
-    return True, "device_binding" if binding else "roblox_profile"
+    if binding and binding["user_id"] == int(user_id):
+        return True, "device_binding"
+    if binding:
+        return True, "device_alias"
+    return True, "roblox_profile"
 
 def get_known_hwid(target: str):
     value = sanitize_text(target or "", 128).strip()
@@ -948,7 +1008,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, place_id=None, job_id=None, activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, experience_name="", subplace_name="", universe_id=None, root_place_id=None, place_id=None, job_id=None, executor_name="", executor_version="", device_type="", activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None):
         connections[username] = self
         user_data[username] = {
             "connection": self,
@@ -960,8 +1020,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "user_id": user_id,
             "admin": bool(is_admin),
             "game_status": game_status or "",
+            "experience_name": experience_name or "",
+            "subplace_name": subplace_name or "",
+            "universe_id": universe_id,
+            "root_place_id": root_place_id,
             "place_id": place_id,
             "job_id": job_id,
+            "executor": executor_name or "",
+            "executor_version": executor_version or "",
+            "device": device_type or "",
             "activity_hidden": bool(activity_hidden),
             "display_name": display_name or "",
             "appearance_username": None,
@@ -1001,8 +1068,17 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         character_appearance = data.get("characterAppearance")
         activity_hidden = bool(data.get("activityHidden", False) or data.get("activity_hidden", False))
         raw_game = (data.get("game") or "").strip()
-        place_id = data.get("placeId")
-        job_id = data.get("jobId")
+        experience_name = sanitize_text(data.get("experienceName") or "", CONFIG["max_game_name_length"]).strip()
+        subplace_name = sanitize_text(data.get("subplaceName") or "", CONFIG["max_game_name_length"]).strip()
+        universe_id = coerce_user_id(data.get("universeId"))
+        root_place_id = coerce_user_id(data.get("rootPlaceId"))
+        place_id = coerce_user_id(data.get("placeId"))
+        job_id = sanitize_text(data.get("jobId") or "", 128).strip()
+        executor_name = sanitize_text(data.get("executor") or "", CONFIG["max_executor_name_length"]).strip()
+        executor_version = sanitize_text(data.get("executorVersion") or "", CONFIG["max_executor_version_length"]).strip()
+        device_type = sanitize_text(data.get("device") or "", CONFIG["max_device_name_length"]).strip().lower()
+        if device_type not in ("mobile", "desktop", "console", "unknown"):
+            device_type = "unknown"
         chat_color = normalize_chat_color(data.get("chatColor"))
         chat_color2 = normalize_optional_chat_color(data.get("chatColor2"))
         if chat_color2 == chat_color:
@@ -1016,6 +1092,34 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if not user_id or user_id <= 0:
             self.send_error_msg("Missing/invalid userId")
             return
+
+        if universe_id and (not experience_name or not root_place_id):
+            try:
+                verified_game_name, verified_root_place_id = await asyncio.wait_for(
+                    fetch_roblox_game(universe_id),
+                    timeout=2.5,
+                )
+            except Exception:
+                verified_game_name, verified_root_place_id = None, None
+            if verified_game_name:
+                experience_name = verified_game_name
+            if verified_root_place_id:
+                root_place_id = verified_root_place_id
+
+        if experience_name:
+            current_place_name = subplace_name
+            if not current_place_name and raw_game and raw_game != experience_name:
+                if " | " in raw_game:
+                    current_place_name = raw_game.split(" | ", 1)[1].strip()
+                else:
+                    current_place_name = raw_game
+            if place_id and root_place_id and place_id != root_place_id and current_place_name and current_place_name != experience_name:
+                raw_game = f"{experience_name} | {current_place_name}"
+                subplace_name = current_place_name
+            else:
+                raw_game = experience_name
+                subplace_name = ""
+            raw_game = sanitize_text(raw_game, CONFIG["max_game_name_length"])
 
         rb_name, rb_display = await fetch_roblox_user(user_id)
         if not rb_name:
@@ -1080,8 +1184,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             user_id=user_id,
             is_admin=is_admin,
             game_status=raw_game,
+            experience_name=experience_name,
+            subplace_name=subplace_name,
+            universe_id=universe_id,
+            root_place_id=root_place_id,
             place_id=place_id,
             job_id=job_id,
+            executor_name=executor_name,
+            executor_version=executor_version,
+            device_type=device_type,
             activity_hidden=activity_hidden,
             display_name=display_name,
             chat_color=chat_color,
@@ -1102,8 +1213,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 "userId": user_id,
                 "admin": is_admin,
                 "game": raw_game,
+                "experienceName": experience_name,
+                "subplaceName": subplace_name,
+                "universeId": universe_id,
+                "rootPlaceId": root_place_id,
                 "placeId": place_id,
                 "jobId": job_id,
+                "executor": executor_name,
+                "executorVersion": executor_version,
+                "device": device_type,
                 "activityHidden": activity_hidden,
             }
         )

@@ -1791,6 +1791,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         now = time.time()
         message_id = uuid.uuid4().hex[:20]
         presented_username, presented_display_name, presented_user_id = get_presented_identity(self.username, info)
+        presentation = get_admin_presentation(info)
         record = {
             "message_id": message_id,
             "username": presented_username,
@@ -1801,6 +1802,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "timestamp": now,
             "user_id": presented_user_id,
             "admin": bool(info.get("admin", False)),
+            "disguised": presentation["disguised"],
+            "show_admin_tag": presentation["show_tag"],
+            "rainbow_messages": presentation["rainbow"],
             "game": info.get("game_status") or "",
             "chat_color": normalize_chat_color(info.get("chat_color")),
             "chat_color2": normalize_optional_chat_color(info.get("chat_color2")),

@@ -2688,6 +2688,19 @@ class HttpClient(IntegrationHandler):
         self.on_close()
 
 
+def drain_http_client_messages(client):
+    messages = []
+    while client.queue:
+        raw = client.queue.popleft()
+        try:
+            messages.append(json.loads(raw))
+        except Exception:
+            continue
+    if not client.queue:
+        client.queue_event.clear()
+    return messages
+
+
 def decode_request_body(request):
     try:
         raw = request.body.decode("utf-8") if request.body else "{}"
@@ -2708,15 +2721,7 @@ class AxxumRegisterHandler(tornado.web.RequestHandler):
         await dispatch_message(client, data)
         client.last_seen = time.time()
 
-        messages = []
-        while client.queue:
-            raw = client.queue.popleft()
-            try:
-                messages.append(json.loads(raw))
-            except Exception:
-                continue
-        if not client.queue:
-            client.queue_event.clear()
+        messages = drain_http_client_messages(client)
 
         self.set_header("Content-Type", "application/json")
         self.set_header("Cache-Control", "no-store")
@@ -2755,16 +2760,7 @@ class AxxumPollHandler(tornado.web.RequestHandler):
             return
 
         client.last_seen = time.time()
-        messages = []
-        while client.queue:
-            raw = client.queue.popleft()
-            try:
-                messages.append(json.loads(raw))
-            except Exception:
-                continue
-
-        if not client.queue:
-            client.queue_event.clear()
+        messages = drain_http_client_messages(client)
 
         if not messages:
             self.set_status(204)
@@ -2789,7 +2785,10 @@ class AxxumSendHandler(tornado.web.RequestHandler):
         data = decode_request_body(self.request)
         client.last_seen = time.time()
         await dispatch_message(client, data)
-        self.write("OK")
+        messages = drain_http_client_messages(client)
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        self.write({"ok": True, "messages": messages})
 
 
 class AxxumDisconnectHandler(tornado.web.RequestHandler):

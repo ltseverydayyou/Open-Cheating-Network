@@ -5,6 +5,7 @@ import asyncio
 import urllib.parse
 import uuid
 import hashlib
+import ipaddress
 import unicodedata
 from collections import deque
 import tornado.httpclient
@@ -50,7 +51,13 @@ http_clients = {}
 banned_users = set()
 muted_until = {}
 banned_hwids = set()
+banned_client_ids = set()
+banned_install_ids = set()
+banned_connection_ids = set()
 known_hwids = {}
+admin_profiles = {}
+DEVICE_SIGNAL_HISTORY_LIMIT = 24
+DEVICE_SIGNAL_SALT = os.environ.get("OCN_DEVICE_SALT", "").strip() or "na-chat-device-v1"
 group_chats = {}
 chat_messages = {}
 chat_message_order = deque()
@@ -113,17 +120,56 @@ def _q7(value):
             out.append(mapped)
     return "".join(out)
 
+def _q10(value, terms):
+    text = unicodedata.normalize("NFKD", sanitize_text(value or "", CONFIG["max_message_length"])).casefold()
+    tokens = []
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        mapped = _q3.get(ch, ch)
+        if mapped.isalpha():
+            tokens.append(mapped)
+        else:
+            tokens.append(None)
+    if not tokens:
+        return False
+
+    for term in terms:
+        if len(term) < 5:
+            continue
+        for start in range(len(tokens)):
+            states = {0}
+            for token in tokens[start:]:
+                next_states = set()
+                for matched in states:
+                    if matched >= len(term):
+                        return True
+                    if token is None:
+                        next_states.add(matched)
+                        next_states.add(matched + 1)
+                    elif token == term[matched]:
+                        next_states.add(matched + 1)
+                if len(term) in next_states:
+                    return True
+                states = next_states
+                if not states:
+                    break
+    return False
+
 def _q8(value):
     normalized = _q7(value)
     if not normalized:
         return None
     if any(term in normalized for term in _q5):
         return 1
-    if any(term in normalized for term in _q6):
+    if any(term in normalized for term in _q6) or _q10(value, _q6):
         return 2
     return None
 
 def _q9(handler, value):
+    username = getattr(handler, "username", None)
+    if username and user_data.get(username, {}).get("admin"):
+        return True
     reason = _q8(value)
     if reason == 1:
         handler.send_error_msg("Message blocked by NA Chat moderation", code="message_blocked")
@@ -307,6 +353,114 @@ def get_presented_identity(username, info):
         info.get("user_id"),
     )
 
+def get_admin_presentation(info):
+    info = info if isinstance(info, dict) else {}
+    privileged = bool(info.get("admin", False))
+    disguised = bool(privileged and info.get("appearance_username"))
+    return {
+        "disguised": disguised,
+        "show_tag": bool(privileged and info.get("show_admin_tag", True) and not disguised),
+        "rainbow": bool(privileged and info.get("rainbow_messages", True) and not disguised),
+    }
+
+def _admin_profile_key(username=None, user_id=None):
+    normalized_user_id = coerce_user_id(user_id)
+    if normalized_user_id:
+        return f"id:{normalized_user_id}"
+    normalized_username = sanitize_text(username or "", CONFIG["max_username_length"]).strip().lower()
+    if normalized_username:
+        return f"name:{normalized_username}"
+    return None
+
+def get_admin_profile(username=None, user_id=None):
+    user_key = _admin_profile_key(None, user_id)
+    if user_key and isinstance(admin_profiles.get(user_key), dict):
+        return dict(admin_profiles[user_key])
+    name_key = _admin_profile_key(username, None)
+    if name_key and isinstance(admin_profiles.get(name_key), dict):
+        return dict(admin_profiles[name_key])
+    return None
+
+def save_admin_profile(username, info):
+    if not isinstance(info, dict) or not info.get("admin"):
+        return False
+    user_id = coerce_user_id(info.get("user_id"))
+    key = _admin_profile_key(username, user_id)
+    if not key:
+        return False
+
+    appearance_username = sanitize_text(
+        info.get("appearance_username") or info.get("_saved_appearance_username") or "",
+        CONFIG["max_username_length"],
+    ).strip()
+    appearance_display_name = sanitize_text(
+        info.get("appearance_display_name") or info.get("_saved_appearance_display_name") or "",
+        CONFIG["max_username_length"],
+    ).strip()
+    appearance_user_id = coerce_user_id(
+        info.get("appearance_user_id") or info.get("_saved_appearance_user_id")
+    )
+
+    profile = {
+        "username": sanitize_text(username or info.get("username") or "", CONFIG["max_username_length"]).strip(),
+        "user_id": user_id,
+        "appearance_username": appearance_username or None,
+        "appearance_display_name": appearance_display_name if appearance_username else None,
+        "appearance_user_id": appearance_user_id if appearance_username else None,
+        "show_admin_tag": info.get("show_admin_tag", True) is not False,
+        "rainbow_messages": info.get("rainbow_messages", True) is not False,
+    }
+    changed = admin_profiles.get(key) != profile
+    admin_profiles[key] = profile
+
+    name_key = _admin_profile_key(username, None)
+    if name_key and name_key != key:
+        admin_profiles.pop(name_key, None)
+    return changed
+
+def refresh_user_presentation(username):
+    info = user_data.get(username)
+    if not isinstance(info, dict):
+        return
+
+    presented_username, presented_display_name, presented_user_id = get_presented_identity(username, info)
+    presentation = get_admin_presentation(info)
+
+    for record in chat_messages.values():
+        if not isinstance(record, dict):
+            continue
+        if record.get("author_username", record.get("username")) != username:
+            continue
+        record["username"] = presented_username
+        record["display_name"] = presented_display_name
+        record["user_id"] = presented_user_id
+        record["disguised"] = presentation["disguised"]
+        record["show_admin_tag"] = presentation["show_tag"]
+        record["rainbow_messages"] = presentation["rainbow"]
+
+    changed_groups = []
+    for group in group_chats.values():
+        changed = False
+        for message in group.get("messages", ()):
+            if not isinstance(message, dict):
+                continue
+            author_username = message.get("authorUsername", message.get("author_username", message.get("from")))
+            if author_username != username:
+                continue
+            message["from"] = presented_username
+            message["displayName"] = presented_display_name
+            message["userId"] = presented_user_id
+            message["disguised"] = presentation["disguised"]
+            message["showAdminTag"] = presentation["show_tag"]
+            message["rainbowMessages"] = presentation["rainbow"]
+            changed = True
+        if changed:
+            changed_groups.append(group)
+
+    broadcast({"type": "chat_history", "messages": chat_history_snapshot()})
+    for group in changed_groups:
+        push_group_update(group)
+
 def get_user_list():
     result = []
     for u, d in user_data.items():
@@ -323,6 +477,8 @@ def get_user_list():
                 "displayName": display_name,
                 "userId": presented_user_id,
                 "admin": bool(d.get("admin", False)),
+                "showAdminTag": get_admin_presentation(d)["show_tag"],
+                "rainbowMessages": get_admin_presentation(d)["rainbow"],
                 "chatColor": normalize_chat_color(d.get("chat_color")),
                 "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
                 "game": "Game: Hidden" if activity_hidden else game_status,
@@ -353,6 +509,8 @@ def get_user_list_admin():
                 "canonicalUserId": d.get("user_id"),
                 "disguised": bool(d.get("admin") and d.get("appearance_username")),
                 "admin": bool(d.get("admin", False)),
+                "showAdminTag": get_admin_presentation(d)["show_tag"],
+                "rainbowMessages": get_admin_presentation(d)["rainbow"],
                 "chatColor": normalize_chat_color(d.get("chat_color")),
                 "chatColor2": normalize_optional_chat_color(d.get("chat_color2")),
                 "hidden": bool(d.get("hidden", False)),
@@ -365,7 +523,7 @@ def get_user_list_admin():
                 "executor": sanitize_text(d.get("executor") or "", CONFIG["max_executor_name_length"]),
                 "executorVersion": sanitize_text(d.get("executor_version") or "", CONFIG["max_executor_version_length"]),
                 "device": sanitize_text(d.get("device") or "", CONFIG["max_device_name_length"]),
-                "hwidFingerprint": (d.get("hwid") or "")[:16] or None,
+                "hwidFingerprint": (d.get("hwid") or d.get("client_id") or d.get("install_id") or d.get("connection_id") or "")[:16] or None,
             }
         )
     return result
@@ -386,6 +544,9 @@ def unban_user(username: str):
 def get_ban_list():
     return sorted(banned_users)
 
+def _valid_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
 def normalize_hwid(value):
     if value is None:
         return None
@@ -397,24 +558,160 @@ def normalize_hwid(value):
         return None
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-def remember_hwid(username: str, hwid_hash, user_id=None):
-    if not username or not hwid_hash:
+def normalize_device_identifier(value, namespace):
+    raw = sanitize_text(value or "", 512).strip()
+    if not raw:
+        return None
+    material = f"{DEVICE_SIGNAL_SALT}|{namespace}|{raw}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(material).hexdigest()
+
+# Forwarded connection metadata is used only to build a one-way fingerprint for NA Chat moderation/device-ban evasion checks.
+# It is not persisted as raw connection-address history in NA Chat state; the current source may still appear in server console connection logs.
+def _extract_connection_source(handler):
+    request = getattr(handler, "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        headers = getattr(handler, "headers", None)
+
+    candidates = []
+    if headers is not None:
+        for header_name in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
+            try:
+                value = headers.get(header_name)
+            except Exception:
+                value = None
+            if value:
+                candidates.extend(str(value).split(","))
+    candidates.append(getattr(handler, "connection_source", None))
+    if request is not None:
+        candidates.append(getattr(request, "remote_ip", None))
+
+    for value in candidates:
+        value = sanitize_text(value or "", 128).strip()
+        if not value:
+            continue
+        if value.startswith("[") and "]" in value:
+            value = value[1:value.index("]")]
+        elif value.count(":") == 1 and "." in value:
+            value = value.rsplit(":", 1)[0]
+        try:
+            parsed = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if parsed.is_global:
+            return parsed.compressed
+    return None
+
+def connection_fingerprint(handler):
+    source = _extract_connection_source(handler)
+    if not source:
+        return None
+
+    request = getattr(handler, "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        headers = getattr(handler, "headers", None)
+    user_agent = ""
+    if headers is not None:
+        try:
+            user_agent = sanitize_text(headers.get("User-Agent") or "", 256).strip().casefold()
+        except Exception:
+            user_agent = ""
+    if not user_agent:
+        return None
+    return normalize_device_identifier(f"{source}|{user_agent}", "connection")
+
+def _entry_signal_set(entry, list_key, legacy_key=None):
+    values = set()
+    if not isinstance(entry, dict):
+        return values
+    raw_values = entry.get(list_key)
+    if isinstance(raw_values, (list, tuple, set)):
+        for value in raw_values:
+            digest = sanitize_text(value or "", 64).strip().lower()
+            if _valid_digest(digest):
+                values.add(digest)
+    if legacy_key:
+        digest = sanitize_text(entry.get(legacy_key) or "", 64).strip().lower()
+        if _valid_digest(digest):
+            values.add(digest)
+    return values
+
+def _entry_device_bundle(entry):
+    return {
+        "hwids": _entry_signal_set(entry, "hwids", "hwid"),
+        "client_ids": _entry_signal_set(entry, "client_ids"),
+        "install_ids": _entry_signal_set(entry, "install_ids"),
+        "connection_ids": _entry_signal_set(entry, "connection_ids"),
+    }
+
+def _current_device_bundle(hwid_hash=None, client_id_hash=None, install_id_hash=None, connection_id_hash=None):
+    return {
+        "hwids": {hwid_hash} if _valid_digest(hwid_hash) else set(),
+        "client_ids": {client_id_hash} if _valid_digest(client_id_hash) else set(),
+        "install_ids": {install_id_hash} if _valid_digest(install_id_hash) else set(),
+        "connection_ids": {connection_id_hash} if _valid_digest(connection_id_hash) else set(),
+    }
+
+def _bundle_has_any(bundle):
+    return any(bundle.get(key) for key in ("hwids", "client_ids", "install_ids", "connection_ids"))
+
+def _merge_device_bundles(target, source):
+    for key in ("hwids", "client_ids", "install_ids", "connection_ids"):
+        target.setdefault(key, set()).update(source.get(key) or ())
+    return target
+
+def _trim_signal_values(values):
+    return sorted(values)[-DEVICE_SIGNAL_HISTORY_LIMIT:]
+
+def remember_device_signals(username, user_id=None, hwid_hash=None, client_id_hash=None, install_id_hash=None, connection_id_hash=None):
+    if not username:
         return False
     key = username.lower()
     previous = known_hwids.get(key)
-    previous_hash = previous.get("hwid") if isinstance(previous, dict) else previous
-    previous_name = previous.get("username") if isinstance(previous, dict) else None
-    previous_user_id = coerce_user_id(previous.get("user_id")) if isinstance(previous, dict) else None
+    entry = dict(previous) if isinstance(previous, dict) else {}
+    before = _entry_device_bundle(entry)
+
+    bundle = {
+        "hwids": set(before["hwids"]),
+        "client_ids": set(before["client_ids"]),
+        "install_ids": set(before["install_ids"]),
+        "connection_ids": set(before["connection_ids"]),
+    }
+    _merge_device_bundles(bundle, _current_device_bundle(hwid_hash, client_id_hash, install_id_hash, connection_id_hash))
+
     normalized_user_id = coerce_user_id(user_id)
-    changed = previous_hash != hwid_hash or previous_name != username or previous_user_id != normalized_user_id
-    known_hwids[key] = {"username": username, "hwid": hwid_hash, "user_id": normalized_user_id}
+    if normalized_user_id:
+        for other in known_hwids.values():
+            if not isinstance(other, dict) or coerce_user_id(other.get("user_id")) != normalized_user_id:
+                continue
+            _merge_device_bundles(bundle, _entry_device_bundle(other))
+
+    current_hwid = hwid_hash if _valid_digest(hwid_hash) else entry.get("hwid")
+    if not _valid_digest(current_hwid):
+        current_hwid = next(iter(bundle["hwids"]), None)
+
+    updated = {
+        "username": username,
+        "user_id": normalized_user_id,
+        "hwid": current_hwid,
+        "hwids": _trim_signal_values(bundle["hwids"]),
+        "client_ids": _trim_signal_values(bundle["client_ids"]),
+        "install_ids": _trim_signal_values(bundle["install_ids"]),
+        "connection_ids": _trim_signal_values(bundle["connection_ids"]),
+    }
+    changed = updated != entry
+    known_hwids[key] = updated
     return changed
+
+def remember_hwid(username: str, hwid_hash, user_id=None):
+    return remember_device_signals(username, user_id=user_id, hwid_hash=hwid_hash)
 
 def get_hwid_identity_binding(hwid_hash):
     if not hwid_hash:
         return None
     for entry in known_hwids.values():
-        if not isinstance(entry, dict) or entry.get("hwid") != hwid_hash:
+        if not isinstance(entry, dict) or hwid_hash not in _entry_device_bundle(entry)["hwids"]:
             continue
         user_id = coerce_user_id(entry.get("user_id"))
         if user_id:
@@ -460,55 +757,112 @@ async def verify_registration_identity(user_id, hwid_hash, character_appearance_
         return True, "device_alias"
     return True, "roblox_profile"
 
-def get_known_hwid(target: str):
+def _bundle_is_banned(bundle):
+    return bool(
+        (bundle.get("hwids") or set()) & banned_hwids
+        or (bundle.get("client_ids") or set()) & banned_client_ids
+        or (bundle.get("install_ids") or set()) & banned_install_ids
+        or (bundle.get("connection_ids") or set()) & banned_connection_ids
+    )
+
+def _ban_device_bundle(bundle):
+    banned_hwids.update(bundle.get("hwids") or ())
+    banned_client_ids.update(bundle.get("client_ids") or ())
+    banned_install_ids.update(bundle.get("install_ids") or ())
+    banned_connection_ids.update(bundle.get("connection_ids") or ())
+
+def _unban_device_bundle(bundle):
+    banned_hwids.difference_update(bundle.get("hwids") or ())
+    banned_client_ids.difference_update(bundle.get("client_ids") or ())
+    banned_install_ids.difference_update(bundle.get("install_ids") or ())
+    banned_connection_ids.difference_update(bundle.get("connection_ids") or ())
+
+def _strong_bundle_intersects(left, right):
+    return bool(
+        (left.get("hwids") or set()) & (right.get("hwids") or set())
+        or (left.get("client_ids") or set()) & (right.get("client_ids") or set())
+        or (left.get("install_ids") or set()) & (right.get("install_ids") or set())
+    )
+
+def get_known_device_bundle(target: str, include_linked=True):
     value = sanitize_text(target or "", 128).strip()
     if not value:
-        return None
+        return _current_device_bundle()
+
     lower = value.lower()
-    if len(lower) == 64 and all(ch in "0123456789abcdef" for ch in lower):
-        return lower
-    if 8 <= len(lower) < 64 and all(ch in "0123456789abcdef" for ch in lower):
-        matches = [digest for digest in banned_hwids if digest.startswith(lower)]
-        if len(matches) == 1:
-            return matches[0]
     entry = known_hwids.get(lower)
-    if isinstance(entry, dict):
-        digest = entry.get("hwid")
-    else:
-        digest = entry
-    if isinstance(digest, str) and len(digest) == 64:
-        return digest.lower()
-    resolved = find_online_username(value)
-    if resolved:
-        info = user_data.get(resolved, {})
-        digest = info.get("hwid")
-        if isinstance(digest, str) and len(digest) == 64:
-            return digest.lower()
+    if not isinstance(entry, dict):
+        resolved = find_online_username(value)
+        if resolved:
+            entry = known_hwids.get(resolved.lower())
+
+    if not isinstance(entry, dict):
+        digest = lower
+        if _valid_digest(digest):
+            return _current_device_bundle(hwid_hash=digest)
+        if 8 <= len(digest) < 64 and all(ch in "0123456789abcdef" for ch in digest):
+            matches = [item for item in banned_hwids if item.startswith(digest)]
+            if len(matches) == 1:
+                return _current_device_bundle(hwid_hash=matches[0])
+        return _current_device_bundle()
+
+    bundle = _entry_device_bundle(entry)
+    if not include_linked:
+        return bundle
+
+    changed = True
+    while changed:
+        changed = False
+        for other in known_hwids.values():
+            if not isinstance(other, dict):
+                continue
+            other_bundle = _entry_device_bundle(other)
+            if not _strong_bundle_intersects(bundle, other_bundle):
+                continue
+            before = sum(len(bundle[key]) for key in bundle)
+            _merge_device_bundles(bundle, other_bundle)
+            if sum(len(bundle[key]) for key in bundle) != before:
+                changed = True
+    return bundle
+
+def get_known_hwid(target: str):
+    bundle = get_known_device_bundle(target, include_linked=False)
+    if bundle["hwids"]:
+        return sorted(bundle["hwids"])[-1]
     return None
 
 def is_hwid_banned(hwid_hash) -> bool:
     return bool(hwid_hash and hwid_hash in banned_hwids)
 
 def get_hwid_ban_list():
-    aliases = {}
+    grouped = {}
+    known_banned_hwids = set()
     for entry in known_hwids.values():
-        if isinstance(entry, dict):
-            digest = entry.get("hwid")
-            username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
-        else:
-            digest = entry
-            username = ""
-        if isinstance(digest, str) and digest in banned_hwids and username:
-            aliases.setdefault(digest, []).append(username)
-    out = []
-    for digest in sorted(banned_hwids):
-        users = sorted(set(aliases.get(digest, [])), key=str.lower)
-        out.append({
-            "fingerprint": digest[:16],
-            "users": users,
-        })
-    return out
+        if not isinstance(entry, dict):
+            continue
+        username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
+        if not username:
+            continue
+        bundle = _entry_device_bundle(entry)
+        matched = (
+            sorted(bundle["hwids"] & banned_hwids)
+            + sorted(bundle["client_ids"] & banned_client_ids)
+            + sorted(bundle["install_ids"] & banned_install_ids)
+            + sorted(bundle["connection_ids"] & banned_connection_ids)
+        )
+        if not matched:
+            continue
+        known_banned_hwids.update(bundle["hwids"] & banned_hwids)
+        fingerprint = matched[0][:16]
+        grouped.setdefault(fingerprint, set()).add(username)
 
+    for digest in sorted(banned_hwids - known_banned_hwids):
+        grouped.setdefault(digest[:16], set())
+
+    return [
+        {"fingerprint": fingerprint, "users": sorted(users, key=str.lower)}
+        for fingerprint, users in sorted(grouped.items())
+    ]
 def get_admin_state():
     return {
         "type": "admin_state",
@@ -654,6 +1008,9 @@ def _chat_payload(record, event_type="chat"):
         "authorUsername": record.get("author_username", record.get("username")),
         "authorUserId": record.get("author_user_id", record.get("user_id")),
         "admin": bool(record.get("admin", False)),
+        "disguised": bool(record.get("disguised", False)),
+        "showAdminTag": bool(record.get("show_admin_tag", record.get("admin", False))),
+        "rainbowMessages": bool(record.get("rainbow_messages", record.get("admin", False))),
         "game": record.get("game") or "",
         "chatColor": normalize_chat_color(record.get("chat_color")),
         "chatColor2": normalize_optional_chat_color(record.get("chat_color2")),
@@ -730,26 +1087,57 @@ def _serialize_state():
         if record and not record.get("deleted"):
             history.append(record)
 
+    profiles = []
+    for profile in admin_profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        username = sanitize_text(profile.get("username") or "", CONFIG["max_username_length"]).strip()
+        user_id = coerce_user_id(profile.get("user_id"))
+        if not username and not user_id:
+            continue
+        profiles.append({
+            "username": username,
+            "user_id": user_id,
+            "appearance_username": sanitize_text(profile.get("appearance_username") or "", CONFIG["max_username_length"]).strip() or None,
+            "appearance_display_name": sanitize_text(profile.get("appearance_display_name") or "", CONFIG["max_username_length"]).strip() or None,
+            "appearance_user_id": coerce_user_id(profile.get("appearance_user_id")),
+            "show_admin_tag": profile.get("show_admin_tag", True) is not False,
+            "rainbow_messages": profile.get("rainbow_messages", True) is not False,
+        })
+
     known = []
     for entry in known_hwids.values():
-        if isinstance(entry, dict):
-            username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
-            digest = entry.get("hwid")
-            user_id = coerce_user_id(entry.get("user_id"))
-        else:
-            username = ""
-            digest = entry
-            user_id = None
-        if username and isinstance(digest, str) and len(digest) == 64:
-            known.append({"username": username, "hwid": digest, "user_id": user_id})
+        if not isinstance(entry, dict):
+            continue
+        username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
+        user_id = coerce_user_id(entry.get("user_id"))
+        bundle = _entry_device_bundle(entry)
+        if not username or not _bundle_has_any(bundle):
+            continue
+        current_hwid = entry.get("hwid")
+        if not _valid_digest(current_hwid):
+            current_hwid = next(iter(bundle["hwids"]), None)
+        known.append({
+            "username": username,
+            "user_id": user_id,
+            "hwid": current_hwid,
+            "hwids": sorted(bundle["hwids"]),
+            "client_ids": sorted(bundle["client_ids"]),
+            "install_ids": sorted(bundle["install_ids"]),
+            "connection_ids": sorted(bundle["connection_ids"]),
+        })
 
     return {
-        "version": 2,
+        "version": 4,
         "groups": groups,
+        "admin_profiles": profiles,
         "chat_messages": history,
         "banned_users": get_ban_list(),
         "muted": get_mute_list(),
         "banned_hwids": sorted(banned_hwids),
+        "banned_client_ids": sorted(banned_client_ids),
+        "banned_install_ids": sorted(banned_install_ids),
+        "banned_connection_ids": sorted(banned_connection_ids),
         "known_hwids": known,
     }
 
@@ -817,12 +1205,46 @@ def _load_state():
                     "reason": sanitize_text(item.get("reason") or "", 200),
                 }
 
-    loaded_hwid_bans = payload.get("banned_hwids") if isinstance(payload, dict) else None
-    if isinstance(loaded_hwid_bans, list):
-        for item in loaded_hwid_bans:
+    for state_key, target_set in (
+        ("banned_hwids", banned_hwids),
+        ("banned_client_ids", banned_client_ids),
+        ("banned_install_ids", banned_install_ids),
+        ("banned_connection_ids", banned_connection_ids),
+    ):
+        loaded = payload.get(state_key) if isinstance(payload, dict) else None
+        if not isinstance(loaded, list):
+            continue
+        for item in loaded:
             digest = sanitize_text(item or "", 64).strip().lower()
-            if len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
-                banned_hwids.add(digest)
+            if _valid_digest(digest):
+                target_set.add(digest)
+
+    loaded_profiles = payload.get("admin_profiles") if isinstance(payload, dict) else None
+    if isinstance(loaded_profiles, list):
+        for item in loaded_profiles:
+            if not isinstance(item, dict):
+                continue
+            username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip()
+            user_id = coerce_user_id(item.get("user_id"))
+            key = _admin_profile_key(username, user_id)
+            if not key:
+                continue
+            appearance_username = sanitize_text(
+                item.get("appearance_username") or "",
+                CONFIG["max_username_length"],
+            ).strip()
+            admin_profiles[key] = {
+                "username": username,
+                "user_id": user_id,
+                "appearance_username": appearance_username or None,
+                "appearance_display_name": sanitize_text(
+                    item.get("appearance_display_name") or "",
+                    CONFIG["max_username_length"],
+                ).strip() if appearance_username else None,
+                "appearance_user_id": coerce_user_id(item.get("appearance_user_id")) if appearance_username else None,
+                "show_admin_tag": item.get("show_admin_tag", True) is not False,
+                "rainbow_messages": item.get("rainbow_messages", True) is not False,
+            }
 
     loaded_known_hwids = payload.get("known_hwids") if isinstance(payload, dict) else None
     if isinstance(loaded_known_hwids, list):
@@ -830,10 +1252,24 @@ def _load_state():
             if not isinstance(item, dict):
                 continue
             username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip()
-            digest = sanitize_text(item.get("hwid") or "", 64).strip().lower()
+            if not username:
+                continue
             user_id = coerce_user_id(item.get("user_id"))
-            if username and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
-                known_hwids[username.lower()] = {"username": username, "hwid": digest, "user_id": user_id}
+            bundle = _entry_device_bundle(item)
+            digest = sanitize_text(item.get("hwid") or "", 64).strip().lower()
+            if _valid_digest(digest):
+                bundle["hwids"].add(digest)
+            if not _bundle_has_any(bundle):
+                continue
+            known_hwids[username.lower()] = {
+                "username": username,
+                "user_id": user_id,
+                "hwid": digest if _valid_digest(digest) else next(iter(bundle["hwids"]), None),
+                "hwids": _trim_signal_values(bundle["hwids"]),
+                "client_ids": _trim_signal_values(bundle["client_ids"]),
+                "install_ids": _trim_signal_values(bundle["install_ids"]),
+                "connection_ids": _trim_signal_values(bundle["connection_ids"]),
+            }
 
     loaded_groups = payload.get("groups") if isinstance(payload, dict) else None
     if isinstance(loaded_groups, list):
@@ -945,8 +1381,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
     def open(self):
         self.username = None
-        self.ip = self.request.remote_ip
-        print("new connection from", self.ip)
+        self.connection_source = self.request.remote_ip
 
     async def on_message(self, message):
         try:
@@ -1008,7 +1443,32 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, experience_name="", subplace_name="", universe_id=None, root_place_id=None, place_id=None, job_id=None, executor_name="", executor_version="", device_type="", activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, experience_name="", subplace_name="", universe_id=None, root_place_id=None, place_id=None, job_id=None, executor_name="", executor_version="", device_type="", activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None, client_id_hash=None, install_id_hash=None, connection_id_hash=None):
+        saved_profile = get_admin_profile(username, user_id) if is_admin else None
+        appearance_username = None
+        appearance_display_name = None
+        appearance_user_id = None
+        show_admin_tag = True
+        rainbow_messages = True
+
+        if isinstance(saved_profile, dict):
+            show_admin_tag = saved_profile.get("show_admin_tag", True) is not False
+            rainbow_messages = saved_profile.get("rainbow_messages", True) is not False
+            saved_appearance = sanitize_text(
+                saved_profile.get("appearance_username") or "",
+                CONFIG["max_username_length"],
+            ).strip()
+            saved_appearance_user_id = coerce_user_id(saved_profile.get("appearance_user_id"))
+            if saved_appearance and saved_appearance_user_id:
+                online_target = find_online_username(saved_appearance)
+                if not online_target or online_target == username:
+                    appearance_username = saved_appearance
+                    appearance_display_name = sanitize_text(
+                        saved_profile.get("appearance_display_name") or "",
+                        CONFIG["max_username_length"],
+                    ).strip()
+                    appearance_user_id = saved_appearance_user_id
+
         connections[username] = self
         user_data[username] = {
             "connection": self,
@@ -1031,12 +1491,20 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "device": device_type or "",
             "activity_hidden": bool(activity_hidden),
             "display_name": display_name or "",
-            "appearance_username": None,
-            "appearance_display_name": None,
-            "appearance_user_id": None,
+            "appearance_username": appearance_username,
+            "appearance_display_name": appearance_display_name,
+            "appearance_user_id": appearance_user_id,
+            "_saved_appearance_username": saved_profile.get("appearance_username") if isinstance(saved_profile, dict) else None,
+            "_saved_appearance_display_name": saved_profile.get("appearance_display_name") if isinstance(saved_profile, dict) else None,
+            "_saved_appearance_user_id": coerce_user_id(saved_profile.get("appearance_user_id")) if isinstance(saved_profile, dict) else None,
+            "show_admin_tag": show_admin_tag,
+            "rainbow_messages": rainbow_messages,
             "chat_color": normalize_chat_color(chat_color),
             "chat_color2": normalize_optional_chat_color(chat_color2),
             "hwid": hwid_hash,
+            "client_id": client_id_hash,
+            "install_id": install_id_hash,
+            "connection_id": connection_id_hash,
         }
 
     def remove_user(self):
@@ -1084,6 +1552,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if chat_color2 == chat_color:
             chat_color2 = None
         hwid_hash = normalize_hwid(data.get("hwid"))
+        client_id_hash = normalize_device_identifier(data.get("analyticsClientId"), "analytics")
+        install_id_hash = normalize_device_identifier(data.get("installId"), "install")
+        connection_id_hash = connection_fingerprint(self)
+        current_device_bundle = _current_device_bundle(
+            hwid_hash,
+            client_id_hash,
+            install_id_hash,
+            connection_id_hash,
+        )
 
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
@@ -1154,15 +1631,28 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 pass
             return
 
-        if is_hwid_banned(hwid_hash):
-            self.send_error_msg("This device is HWID banned from NA Chat", code="hwid_banned")
+        device_state_changed = remember_device_signals(
+            username,
+            user_id=user_id,
+            hwid_hash=hwid_hash,
+            client_id_hash=client_id_hash,
+            install_id_hash=install_id_hash,
+            connection_id_hash=connection_id_hash,
+        )
+        linked_device_bundle = get_known_device_bundle(username, include_linked=True)
+
+        if _bundle_is_banned(current_device_bundle) or _bundle_is_banned(linked_device_bundle):
+            _ban_device_bundle(current_device_bundle)
+            _ban_device_bundle(linked_device_bundle)
+            schedule_state_save()
+            self.send_error_msg("This device is banned from NA Chat", code="hwid_banned")
             try:
-                self.close(4003, "HWID banned from NA Chat")
+                self.close(4003, "Device banned from NA Chat")
             except Exception:
                 pass
             return
 
-        if hwid_hash and remember_hwid(username, hwid_hash, user_id):
+        if device_state_changed:
             schedule_state_save()
 
         if username in connections and connections[username] is not self:
@@ -1178,6 +1668,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         is_admin = user_id in ADMIN_IDS
 
         self.username = username
+        log_source = _extract_connection_source(self) or getattr(self, "connection_source", None) or "unknown"
+        print(f"new connection from {username} {log_source}")
         self.add_user(
             username,
             hidden,
@@ -1198,6 +1690,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             chat_color=chat_color,
             chat_color2=chat_color2,
             hwid_hash=hwid_hash,
+            client_id_hash=client_id_hash,
+            install_id_hash=install_id_hash,
+            connection_id_hash=connection_id_hash,
         )
         schedule_presence()
 
@@ -1229,6 +1724,25 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         self.send({"type": "chat_history", "messages": chat_history_snapshot()})
         self.send({"type": "user_list", "users": get_user_list()})
         if is_admin:
+            info = user_data.get(username, {})
+            presentation = get_admin_presentation(info)
+            self.send({
+                "type": "admin_presentation_updated",
+                "showTag": bool(info.get("show_admin_tag", True)),
+                "rainbowMessages": bool(info.get("rainbow_messages", True)),
+                "effectiveShowTag": presentation["show_tag"],
+                "effectiveRainbowMessages": presentation["rainbow"],
+            })
+            if info.get("appearance_username") and info.get("appearance_user_id"):
+                self.send({
+                    "type": "admin_disguise_updated",
+                    "enabled": True,
+                    "username": info.get("appearance_username"),
+                    "displayName": info.get("appearance_display_name") or "",
+                    "userId": info.get("appearance_user_id"),
+                })
+            else:
+                self.send({"type": "admin_disguise_updated", "enabled": False})
             self.send({"type": "user_list_admin", "users": get_user_list_admin()})
             self.send(get_admin_state())
             self.send({"type": "admin_dm_history", "messages": list(admin_dm_history)})
@@ -1646,6 +2160,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             for member in recipients:
                 if member != self.username:
                     send_to_user(member, {"type": "group_removed", "groupId": group_id})
+            self.send({"type": "group_removed", "groupId": group_id})
             schedule_state_save()
             return
         group["members"].discard(self.username)
@@ -1679,6 +2194,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             return
         info = user_data.get(self.username, {})
         presented_username, presented_display_name, presented_user_id = get_presented_identity(self.username, info)
+        presentation = get_admin_presentation(info)
         payload = {
             "type": "group_message",
             "groupId": group["id"],
@@ -1689,6 +2205,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "authorUsername": self.username,
             "authorUserId": info.get("user_id"),
             "admin": bool(info.get("admin", False)),
+            "disguised": presentation["disguised"],
+            "showAdminTag": presentation["show_tag"],
+            "rainbowMessages": presentation["rainbow"],
             "chatColor": normalize_chat_color(info.get("chat_color")),
             "chatColor2": normalize_optional_chat_color(info.get("chat_color2")),
             "message": message,
@@ -1701,6 +2220,9 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "authorUsername": self.username,
             "authorUserId": info.get("user_id"),
             "admin": bool(info.get("admin", False)),
+            "disguised": presentation["disguised"],
+            "showAdminTag": presentation["show_tag"],
+            "rainbowMessages": presentation["rainbow"],
             "chatColor": normalize_chat_color(info.get("chat_color")),
             "chatColor2": normalize_optional_chat_color(info.get("chat_color2")),
             "message": message,
@@ -1861,8 +2383,14 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             info["appearance_username"] = None
             info["appearance_display_name"] = None
             info["appearance_user_id"] = None
+            info["_saved_appearance_username"] = None
+            info["_saved_appearance_display_name"] = None
+            info["_saved_appearance_user_id"] = None
+            save_admin_profile(self.username, info)
+            refresh_user_presentation(self.username)
             self.send({"type": "admin_disguise_updated", "enabled": False})
             schedule_presence()
+            schedule_state_save()
             return
 
         target_user_id, target_name, target_display = await fetch_roblox_user_by_name(query)
@@ -1878,6 +2406,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         info["appearance_username"] = target_name
         info["appearance_display_name"] = target_display or ""
         info["appearance_user_id"] = target_user_id
+        info["_saved_appearance_username"] = target_name
+        info["_saved_appearance_display_name"] = target_display or ""
+        info["_saved_appearance_user_id"] = target_user_id
+        save_admin_profile(self.username, info)
+        refresh_user_presentation(self.username)
         self.send({
             "type": "admin_disguise_updated",
             "enabled": True,
@@ -1886,6 +2419,34 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "userId": target_user_id,
         })
         schedule_presence()
+        schedule_state_save()
+
+    def handle_admin_presentation(self, data):
+        if not self.username:
+            self.send_error_msg("Not registered")
+            return
+        info = user_data.get(self.username, {})
+        if not info.get("admin"):
+            self.send_error_msg("Not authorized")
+            return
+
+        if "showTag" in data:
+            info["show_admin_tag"] = data.get("showTag") is True
+        if "rainbowMessages" in data:
+            info["rainbow_messages"] = data.get("rainbowMessages") is True
+
+        save_admin_profile(self.username, info)
+        refresh_user_presentation(self.username)
+        presentation = get_admin_presentation(info)
+        self.send({
+            "type": "admin_presentation_updated",
+            "showTag": bool(info.get("show_admin_tag", True)),
+            "rainbowMessages": bool(info.get("rainbow_messages", True)),
+            "effectiveShowTag": presentation["show_tag"],
+            "effectiveRainbowMessages": presentation["rainbow"],
+        })
+        schedule_presence()
+        schedule_state_save()
 
     def handle_admin_action(self, data):
         if not self.username:
@@ -1962,26 +2523,26 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             broadcast({"type": "system", "message": f"{target} was unmuted in NA Chat"})
 
         elif action == "hwid_ban":
-            digest = get_known_hwid(resolved_target)
-            if not digest:
-                self.send_error_msg("No HWID is available for that user; their executor may not expose gethwid()", code="hwid_unavailable")
+            bundle = get_known_device_bundle(resolved_target, include_linked=True)
+            if not _bundle_has_any(bundle):
+                self.send_error_msg("No device fingerprint is available for that user", code="hwid_unavailable")
                 return
-            banned_hwids.add(digest)
+            _ban_device_bundle(bundle)
             state_changed = True
             ws = connections.get(resolved_target)
             if ws:
                 try:
-                    ws.close(4003, "HWID banned from NA Chat")
+                    ws.close(4003, "Device banned from NA Chat")
                 except Exception:
                     pass
             broadcast({"type": "system", "message": f"{resolved_target} was HWID banned from NA Chat"})
 
         elif action == "unhwid_ban":
-            digest = get_known_hwid(target)
-            if not digest or digest not in banned_hwids:
+            bundle = get_known_device_bundle(target, include_linked=True)
+            if not _bundle_has_any(bundle) or not _bundle_is_banned(bundle):
                 self.send_error_msg("HWID ban not found", code="hwid_ban_not_found")
                 return
-            banned_hwids.discard(digest)
+            _unban_device_bundle(bundle)
             state_changed = True
             self.send({"type": "system", "message": f"HWID ban removed for {target}"})
 
@@ -2080,6 +2641,8 @@ async def dispatch_message(client, data):
         client.handle_notify3(data)
     elif t == "admin_disguise":
         await client.handle_admin_disguise(data)
+    elif t == "admin_presentation":
+        client.handle_admin_presentation(data)
     elif t == "admin_action":
         client.handle_admin_action(data)
     else:
@@ -2089,9 +2652,10 @@ async def dispatch_message(client, data):
 class HttpClient(IntegrationHandler):
     """A small adapter that gives HTTP polling clients the same interface as WebSockets."""
 
-    def __init__(self, client_id, ip):
+    def __init__(self, client_id, connection_source, headers=None):
         self.client_id = client_id
-        self.ip = ip
+        self.connection_source = connection_source
+        self.headers = dict(headers or {})
         self.username = None
         self.closed = False
         self.last_seen = time.time()
@@ -2127,7 +2691,7 @@ class AxxumRegisterHandler(tornado.web.RequestHandler):
     async def post(self):
         data = decode_request_body(self.request)
         client_id = uuid.uuid4().hex
-        client = HttpClient(client_id, self.request.remote_ip)
+        client = HttpClient(client_id, self.request.remote_ip, self.request.headers)
         http_clients[client_id] = client
         await dispatch_message(client, data)
         client.last_seen = time.time()

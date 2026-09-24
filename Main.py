@@ -923,6 +923,36 @@ def get_mute_list():
             muted_until.pop(name, None)
     return out
 
+def _consume_write_future(future):
+    if future is None or not hasattr(future, "add_done_callback"):
+        return future
+
+    def _done(done):
+        try:
+            done.result()
+        except (tornado.websocket.WebSocketClosedError, tornado.iostream.StreamClosedError):
+            pass
+        except Exception:
+            pass
+
+    try:
+        future.add_done_callback(_done)
+    except Exception:
+        pass
+    return future
+
+
+def safe_write_message(target, message):
+    try:
+        result = target.write_message(message)
+    except (tornado.websocket.WebSocketClosedError, tornado.iostream.StreamClosedError):
+        return False
+    except Exception:
+        return False
+
+    _consume_write_future(result)
+    return True
+
 def broadcast(obj, exclude=None):
     payload = dict(obj)
     payload.setdefault("timestamp", time.time())
@@ -930,10 +960,7 @@ def broadcast(obj, exclude=None):
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
             continue
-        try:
-            ws.write_message(msg)
-        except Exception:
-            pass
+        safe_write_message(ws, msg)
 
 def broadcast_admin(obj):
     payload = dict(obj)
@@ -942,10 +969,7 @@ def broadcast_admin(obj):
         info = user_data.get(name) or {}
         if info.get("connection") is not ws or not info.get("admin"):
             continue
-        try:
-            ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        safe_write_message(ws, json.dumps(payload, ensure_ascii=False) + "\n")
 
 def send_to_user(username, obj):
     ws = connections.get(username)
@@ -953,11 +977,7 @@ def send_to_user(username, obj):
         return False
     payload = dict(obj)
     payload.setdefault("timestamp", time.time())
-    try:
-        ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
-        return True
-    except Exception:
-        return False
+    return safe_write_message(ws, json.dumps(payload, ensure_ascii=False) + "\n")
 
 def find_online_username(target):
     if target is None:
@@ -1424,17 +1444,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     chunk["chunkTotal"] = chunks
                     chunk["snapshotId"] = snapshot_id
                     chunk["timestamp"] = snapshot_time
-                    try:
-                        self.write_message(json.dumps(chunk, ensure_ascii=False) + "\n")
-                    except Exception:
-                        pass
+                    safe_write_message(self, json.dumps(chunk, ensure_ascii=False) + "\n")
                 return
         payload = dict(obj)
         payload.setdefault("timestamp", time.time())
-        try:
-            self.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+        safe_write_message(self, json.dumps(payload, ensure_ascii=False) + "\n")
 
     def send_error_msg(self, msg, code=None, **extra):
         payload = {"type": "error", "message": msg}
@@ -2263,10 +2277,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
-                try:
-                    ws.write_message(msg)
-                except Exception:
-                    pass
+                safe_write_message(ws, msg)
 
     def _send_targeted_by_user_id(self, payload, target):
         if target is None or target == "" or target == "all":
@@ -2284,11 +2295,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
-                try:
-                    ws.write_message(msg)
+                if safe_write_message(ws, msg):
                     sent_any = True
-                except Exception:
-                    pass
         if not sent_any:
             self.send_error_msg("Target not online")
             return False

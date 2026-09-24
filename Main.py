@@ -5,7 +5,6 @@ import asyncio
 import urllib.parse
 import uuid
 import hashlib
-import ipaddress
 import unicodedata
 from collections import deque
 import tornado.httpclient
@@ -51,13 +50,8 @@ http_clients = {}
 banned_users = set()
 muted_until = {}
 banned_hwids = set()
-banned_client_ids = set()
-banned_install_ids = set()
-banned_connection_ids = set()
 known_hwids = {}
 admin_profiles = {}
-DEVICE_SIGNAL_HISTORY_LIMIT = 24
-DEVICE_SIGNAL_SALT = os.environ.get("OCN_DEVICE_SALT", "").strip() or "na-chat-device-v1"
 group_chats = {}
 chat_messages = {}
 chat_message_order = deque()
@@ -523,7 +517,7 @@ def get_user_list_admin():
                 "executor": sanitize_text(d.get("executor") or "", CONFIG["max_executor_name_length"]),
                 "executorVersion": sanitize_text(d.get("executor_version") or "", CONFIG["max_executor_version_length"]),
                 "device": sanitize_text(d.get("device") or "", CONFIG["max_device_name_length"]),
-                "hwidFingerprint": (d.get("hwid") or d.get("client_id") or d.get("install_id") or d.get("connection_id") or "")[:16] or None,
+                "hwidFingerprint": (d.get("hwid") or "")[:16] or None,
             }
         )
     return result
@@ -544,9 +538,6 @@ def unban_user(username: str):
 def get_ban_list():
     return sorted(banned_users)
 
-def _valid_digest(value):
-    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
-
 def normalize_hwid(value):
     if value is None:
         return None
@@ -558,160 +549,24 @@ def normalize_hwid(value):
         return None
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-def normalize_device_identifier(value, namespace):
-    raw = sanitize_text(value or "", 512).strip()
-    if not raw:
-        return None
-    material = f"{DEVICE_SIGNAL_SALT}|{namespace}|{raw}".encode("utf-8", errors="ignore")
-    return hashlib.sha256(material).hexdigest()
-
-# Forwarded connection metadata is used only to build a one-way fingerprint for NA Chat moderation/device-ban evasion checks.
-# It is not persisted as raw connection-address history in NA Chat state; the current source may still appear in server console connection logs.
-def _extract_connection_source(handler):
-    request = getattr(handler, "request", None)
-    headers = getattr(request, "headers", None)
-    if headers is None:
-        headers = getattr(handler, "headers", None)
-
-    candidates = []
-    if headers is not None:
-        for header_name in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
-            try:
-                value = headers.get(header_name)
-            except Exception:
-                value = None
-            if value:
-                candidates.extend(str(value).split(","))
-    candidates.append(getattr(handler, "connection_source", None))
-    if request is not None:
-        candidates.append(getattr(request, "remote_ip", None))
-
-    for value in candidates:
-        value = sanitize_text(value or "", 128).strip()
-        if not value:
-            continue
-        if value.startswith("[") and "]" in value:
-            value = value[1:value.index("]")]
-        elif value.count(":") == 1 and "." in value:
-            value = value.rsplit(":", 1)[0]
-        try:
-            parsed = ipaddress.ip_address(value)
-        except ValueError:
-            continue
-        if parsed.is_global:
-            return parsed.compressed
-    return None
-
-def connection_fingerprint(handler):
-    source = _extract_connection_source(handler)
-    if not source:
-        return None
-
-    request = getattr(handler, "request", None)
-    headers = getattr(request, "headers", None)
-    if headers is None:
-        headers = getattr(handler, "headers", None)
-    user_agent = ""
-    if headers is not None:
-        try:
-            user_agent = sanitize_text(headers.get("User-Agent") or "", 256).strip().casefold()
-        except Exception:
-            user_agent = ""
-    if not user_agent:
-        return None
-    return normalize_device_identifier(f"{source}|{user_agent}", "connection")
-
-def _entry_signal_set(entry, list_key, legacy_key=None):
-    values = set()
-    if not isinstance(entry, dict):
-        return values
-    raw_values = entry.get(list_key)
-    if isinstance(raw_values, (list, tuple, set)):
-        for value in raw_values:
-            digest = sanitize_text(value or "", 64).strip().lower()
-            if _valid_digest(digest):
-                values.add(digest)
-    if legacy_key:
-        digest = sanitize_text(entry.get(legacy_key) or "", 64).strip().lower()
-        if _valid_digest(digest):
-            values.add(digest)
-    return values
-
-def _entry_device_bundle(entry):
-    return {
-        "hwids": _entry_signal_set(entry, "hwids", "hwid"),
-        "client_ids": _entry_signal_set(entry, "client_ids"),
-        "install_ids": _entry_signal_set(entry, "install_ids"),
-        "connection_ids": _entry_signal_set(entry, "connection_ids"),
-    }
-
-def _current_device_bundle(hwid_hash=None, client_id_hash=None, install_id_hash=None, connection_id_hash=None):
-    return {
-        "hwids": {hwid_hash} if _valid_digest(hwid_hash) else set(),
-        "client_ids": {client_id_hash} if _valid_digest(client_id_hash) else set(),
-        "install_ids": {install_id_hash} if _valid_digest(install_id_hash) else set(),
-        "connection_ids": {connection_id_hash} if _valid_digest(connection_id_hash) else set(),
-    }
-
-def _bundle_has_any(bundle):
-    return any(bundle.get(key) for key in ("hwids", "client_ids", "install_ids", "connection_ids"))
-
-def _merge_device_bundles(target, source):
-    for key in ("hwids", "client_ids", "install_ids", "connection_ids"):
-        target.setdefault(key, set()).update(source.get(key) or ())
-    return target
-
-def _trim_signal_values(values):
-    return sorted(values)[-DEVICE_SIGNAL_HISTORY_LIMIT:]
-
-def remember_device_signals(username, user_id=None, hwid_hash=None, client_id_hash=None, install_id_hash=None, connection_id_hash=None):
-    if not username:
+def remember_hwid(username: str, hwid_hash, user_id=None):
+    if not username or not hwid_hash:
         return False
     key = username.lower()
     previous = known_hwids.get(key)
-    entry = dict(previous) if isinstance(previous, dict) else {}
-    before = _entry_device_bundle(entry)
-
-    bundle = {
-        "hwids": set(before["hwids"]),
-        "client_ids": set(before["client_ids"]),
-        "install_ids": set(before["install_ids"]),
-        "connection_ids": set(before["connection_ids"]),
-    }
-    _merge_device_bundles(bundle, _current_device_bundle(hwid_hash, client_id_hash, install_id_hash, connection_id_hash))
-
+    previous_hash = previous.get("hwid") if isinstance(previous, dict) else previous
+    previous_name = previous.get("username") if isinstance(previous, dict) else None
+    previous_user_id = coerce_user_id(previous.get("user_id")) if isinstance(previous, dict) else None
     normalized_user_id = coerce_user_id(user_id)
-    if normalized_user_id:
-        for other in known_hwids.values():
-            if not isinstance(other, dict) or coerce_user_id(other.get("user_id")) != normalized_user_id:
-                continue
-            _merge_device_bundles(bundle, _entry_device_bundle(other))
-
-    current_hwid = hwid_hash if _valid_digest(hwid_hash) else entry.get("hwid")
-    if not _valid_digest(current_hwid):
-        current_hwid = next(iter(bundle["hwids"]), None)
-
-    updated = {
-        "username": username,
-        "user_id": normalized_user_id,
-        "hwid": current_hwid,
-        "hwids": _trim_signal_values(bundle["hwids"]),
-        "client_ids": _trim_signal_values(bundle["client_ids"]),
-        "install_ids": _trim_signal_values(bundle["install_ids"]),
-        "connection_ids": _trim_signal_values(bundle["connection_ids"]),
-    }
-    changed = updated != entry
-    known_hwids[key] = updated
+    changed = previous_hash != hwid_hash or previous_name != username or previous_user_id != normalized_user_id
+    known_hwids[key] = {"username": username, "hwid": hwid_hash, "user_id": normalized_user_id}
     return changed
-
-def remember_hwid(username: str, hwid_hash, user_id=None):
-    return remember_device_signals(username, user_id=user_id, hwid_hash=hwid_hash)
 
 def get_hwid_identity_binding(hwid_hash):
     if not hwid_hash:
         return None
     for entry in known_hwids.values():
-        if not isinstance(entry, dict) or hwid_hash not in _entry_device_bundle(entry)["hwids"]:
+        if not isinstance(entry, dict) or entry.get("hwid") != hwid_hash:
             continue
         user_id = coerce_user_id(entry.get("user_id"))
         if user_id:
@@ -757,112 +612,55 @@ async def verify_registration_identity(user_id, hwid_hash, character_appearance_
         return True, "device_alias"
     return True, "roblox_profile"
 
-def _bundle_is_banned(bundle):
-    return bool(
-        (bundle.get("hwids") or set()) & banned_hwids
-        or (bundle.get("client_ids") or set()) & banned_client_ids
-        or (bundle.get("install_ids") or set()) & banned_install_ids
-        or (bundle.get("connection_ids") or set()) & banned_connection_ids
-    )
-
-def _ban_device_bundle(bundle):
-    banned_hwids.update(bundle.get("hwids") or ())
-    banned_client_ids.update(bundle.get("client_ids") or ())
-    banned_install_ids.update(bundle.get("install_ids") or ())
-    banned_connection_ids.update(bundle.get("connection_ids") or ())
-
-def _unban_device_bundle(bundle):
-    banned_hwids.difference_update(bundle.get("hwids") or ())
-    banned_client_ids.difference_update(bundle.get("client_ids") or ())
-    banned_install_ids.difference_update(bundle.get("install_ids") or ())
-    banned_connection_ids.difference_update(bundle.get("connection_ids") or ())
-
-def _strong_bundle_intersects(left, right):
-    return bool(
-        (left.get("hwids") or set()) & (right.get("hwids") or set())
-        or (left.get("client_ids") or set()) & (right.get("client_ids") or set())
-        or (left.get("install_ids") or set()) & (right.get("install_ids") or set())
-    )
-
-def get_known_device_bundle(target: str, include_linked=True):
+def get_known_hwid(target: str):
     value = sanitize_text(target or "", 128).strip()
     if not value:
-        return _current_device_bundle()
-
+        return None
     lower = value.lower()
+    if len(lower) == 64 and all(ch in "0123456789abcdef" for ch in lower):
+        return lower
+    if 8 <= len(lower) < 64 and all(ch in "0123456789abcdef" for ch in lower):
+        matches = [digest for digest in banned_hwids if digest.startswith(lower)]
+        if len(matches) == 1:
+            return matches[0]
     entry = known_hwids.get(lower)
-    if not isinstance(entry, dict):
-        resolved = find_online_username(value)
-        if resolved:
-            entry = known_hwids.get(resolved.lower())
-
-    if not isinstance(entry, dict):
-        digest = lower
-        if _valid_digest(digest):
-            return _current_device_bundle(hwid_hash=digest)
-        if 8 <= len(digest) < 64 and all(ch in "0123456789abcdef" for ch in digest):
-            matches = [item for item in banned_hwids if item.startswith(digest)]
-            if len(matches) == 1:
-                return _current_device_bundle(hwid_hash=matches[0])
-        return _current_device_bundle()
-
-    bundle = _entry_device_bundle(entry)
-    if not include_linked:
-        return bundle
-
-    changed = True
-    while changed:
-        changed = False
-        for other in known_hwids.values():
-            if not isinstance(other, dict):
-                continue
-            other_bundle = _entry_device_bundle(other)
-            if not _strong_bundle_intersects(bundle, other_bundle):
-                continue
-            before = sum(len(bundle[key]) for key in bundle)
-            _merge_device_bundles(bundle, other_bundle)
-            if sum(len(bundle[key]) for key in bundle) != before:
-                changed = True
-    return bundle
-
-def get_known_hwid(target: str):
-    bundle = get_known_device_bundle(target, include_linked=False)
-    if bundle["hwids"]:
-        return sorted(bundle["hwids"])[-1]
+    if isinstance(entry, dict):
+        digest = entry.get("hwid")
+    else:
+        digest = entry
+    if isinstance(digest, str) and len(digest) == 64:
+        return digest.lower()
+    resolved = find_online_username(value)
+    if resolved:
+        info = user_data.get(resolved, {})
+        digest = info.get("hwid")
+        if isinstance(digest, str) and len(digest) == 64:
+            return digest.lower()
     return None
 
 def is_hwid_banned(hwid_hash) -> bool:
     return bool(hwid_hash and hwid_hash in banned_hwids)
 
 def get_hwid_ban_list():
-    grouped = {}
-    known_banned_hwids = set()
+    aliases = {}
     for entry in known_hwids.values():
-        if not isinstance(entry, dict):
-            continue
-        username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
-        if not username:
-            continue
-        bundle = _entry_device_bundle(entry)
-        matched = (
-            sorted(bundle["hwids"] & banned_hwids)
-            + sorted(bundle["client_ids"] & banned_client_ids)
-            + sorted(bundle["install_ids"] & banned_install_ids)
-            + sorted(bundle["connection_ids"] & banned_connection_ids)
-        )
-        if not matched:
-            continue
-        known_banned_hwids.update(bundle["hwids"] & banned_hwids)
-        fingerprint = matched[0][:16]
-        grouped.setdefault(fingerprint, set()).add(username)
+        if isinstance(entry, dict):
+            digest = entry.get("hwid")
+            username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
+        else:
+            digest = entry
+            username = ""
+        if isinstance(digest, str) and digest in banned_hwids and username:
+            aliases.setdefault(digest, []).append(username)
+    out = []
+    for digest in sorted(banned_hwids):
+        users = sorted(set(aliases.get(digest, [])), key=str.lower)
+        out.append({
+            "fingerprint": digest[:16],
+            "users": users,
+        })
+    return out
 
-    for digest in sorted(banned_hwids - known_banned_hwids):
-        grouped.setdefault(digest[:16], set())
-
-    return [
-        {"fingerprint": fingerprint, "users": sorted(users, key=str.lower)}
-        for fingerprint, users in sorted(grouped.items())
-    ]
 def get_admin_state():
     return {
         "type": "admin_state",
@@ -923,36 +721,6 @@ def get_mute_list():
             muted_until.pop(name, None)
     return out
 
-def _consume_write_future(future):
-    if future is None or not hasattr(future, "add_done_callback"):
-        return future
-
-    def _done(done):
-        try:
-            done.result()
-        except (tornado.websocket.WebSocketClosedError, tornado.iostream.StreamClosedError):
-            pass
-        except Exception:
-            pass
-
-    try:
-        future.add_done_callback(_done)
-    except Exception:
-        pass
-    return future
-
-
-def safe_write_message(target, message):
-    try:
-        result = target.write_message(message)
-    except (tornado.websocket.WebSocketClosedError, tornado.iostream.StreamClosedError):
-        return False
-    except Exception:
-        return False
-
-    _consume_write_future(result)
-    return True
-
 def broadcast(obj, exclude=None):
     payload = dict(obj)
     payload.setdefault("timestamp", time.time())
@@ -960,7 +728,10 @@ def broadcast(obj, exclude=None):
     for name, ws in list(connections.items()):
         if exclude and name == exclude:
             continue
-        safe_write_message(ws, msg)
+        try:
+            ws.write_message(msg)
+        except Exception:
+            pass
 
 def broadcast_admin(obj):
     payload = dict(obj)
@@ -969,7 +740,10 @@ def broadcast_admin(obj):
         info = user_data.get(name) or {}
         if info.get("connection") is not ws or not info.get("admin"):
             continue
-        safe_write_message(ws, json.dumps(payload, ensure_ascii=False) + "\n")
+        try:
+            ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
 def send_to_user(username, obj):
     ws = connections.get(username)
@@ -977,7 +751,11 @@ def send_to_user(username, obj):
         return False
     payload = dict(obj)
     payload.setdefault("timestamp", time.time())
-    return safe_write_message(ws, json.dumps(payload, ensure_ascii=False) + "\n")
+    try:
+        ws.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        return False
 
 def find_online_username(target):
     if target is None:
@@ -1029,8 +807,8 @@ def _chat_payload(record, event_type="chat"):
         "authorUserId": record.get("author_user_id", record.get("user_id")),
         "admin": bool(record.get("admin", False)),
         "disguised": bool(record.get("disguised", False)),
-        "showAdminTag": bool(record.get("show_admin_tag", record.get("admin", False))),
-        "rainbowMessages": bool(record.get("rainbow_messages", record.get("admin", False))),
+        "showAdminTag": bool(record.get("show_admin_tag", False)),
+        "rainbowMessages": bool(record.get("rainbow_messages", False)),
         "game": record.get("game") or "",
         "chatColor": normalize_chat_color(record.get("chat_color")),
         "chatColor2": normalize_optional_chat_color(record.get("chat_color2")),
@@ -1127,37 +905,25 @@ def _serialize_state():
 
     known = []
     for entry in known_hwids.values():
-        if not isinstance(entry, dict):
-            continue
-        username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
-        user_id = coerce_user_id(entry.get("user_id"))
-        bundle = _entry_device_bundle(entry)
-        if not username or not _bundle_has_any(bundle):
-            continue
-        current_hwid = entry.get("hwid")
-        if not _valid_digest(current_hwid):
-            current_hwid = next(iter(bundle["hwids"]), None)
-        known.append({
-            "username": username,
-            "user_id": user_id,
-            "hwid": current_hwid,
-            "hwids": sorted(bundle["hwids"]),
-            "client_ids": sorted(bundle["client_ids"]),
-            "install_ids": sorted(bundle["install_ids"]),
-            "connection_ids": sorted(bundle["connection_ids"]),
-        })
+        if isinstance(entry, dict):
+            username = sanitize_text(entry.get("username") or "", CONFIG["max_username_length"]).strip()
+            digest = entry.get("hwid")
+            user_id = coerce_user_id(entry.get("user_id"))
+        else:
+            username = ""
+            digest = entry
+            user_id = None
+        if username and isinstance(digest, str) and len(digest) == 64:
+            known.append({"username": username, "hwid": digest, "user_id": user_id})
 
     return {
-        "version": 4,
+        "version": 3,
         "groups": groups,
         "admin_profiles": profiles,
         "chat_messages": history,
         "banned_users": get_ban_list(),
         "muted": get_mute_list(),
         "banned_hwids": sorted(banned_hwids),
-        "banned_client_ids": sorted(banned_client_ids),
-        "banned_install_ids": sorted(banned_install_ids),
-        "banned_connection_ids": sorted(banned_connection_ids),
         "known_hwids": known,
     }
 
@@ -1225,19 +991,12 @@ def _load_state():
                     "reason": sanitize_text(item.get("reason") or "", 200),
                 }
 
-    for state_key, target_set in (
-        ("banned_hwids", banned_hwids),
-        ("banned_client_ids", banned_client_ids),
-        ("banned_install_ids", banned_install_ids),
-        ("banned_connection_ids", banned_connection_ids),
-    ):
-        loaded = payload.get(state_key) if isinstance(payload, dict) else None
-        if not isinstance(loaded, list):
-            continue
-        for item in loaded:
+    loaded_hwid_bans = payload.get("banned_hwids") if isinstance(payload, dict) else None
+    if isinstance(loaded_hwid_bans, list):
+        for item in loaded_hwid_bans:
             digest = sanitize_text(item or "", 64).strip().lower()
-            if _valid_digest(digest):
-                target_set.add(digest)
+            if len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
+                banned_hwids.add(digest)
 
     loaded_profiles = payload.get("admin_profiles") if isinstance(payload, dict) else None
     if isinstance(loaded_profiles, list):
@@ -1272,24 +1031,10 @@ def _load_state():
             if not isinstance(item, dict):
                 continue
             username = sanitize_text(item.get("username") or "", CONFIG["max_username_length"]).strip()
-            if not username:
-                continue
-            user_id = coerce_user_id(item.get("user_id"))
-            bundle = _entry_device_bundle(item)
             digest = sanitize_text(item.get("hwid") or "", 64).strip().lower()
-            if _valid_digest(digest):
-                bundle["hwids"].add(digest)
-            if not _bundle_has_any(bundle):
-                continue
-            known_hwids[username.lower()] = {
-                "username": username,
-                "user_id": user_id,
-                "hwid": digest if _valid_digest(digest) else next(iter(bundle["hwids"]), None),
-                "hwids": _trim_signal_values(bundle["hwids"]),
-                "client_ids": _trim_signal_values(bundle["client_ids"]),
-                "install_ids": _trim_signal_values(bundle["install_ids"]),
-                "connection_ids": _trim_signal_values(bundle["connection_ids"]),
-            }
+            user_id = coerce_user_id(item.get("user_id"))
+            if username and len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
+                known_hwids[username.lower()] = {"username": username, "hwid": digest, "user_id": user_id}
 
     loaded_groups = payload.get("groups") if isinstance(payload, dict) else None
     if isinstance(loaded_groups, list):
@@ -1401,7 +1146,8 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
     def open(self):
         self.username = None
-        self.connection_source = self.request.remote_ip
+        self.ip = self.request.remote_ip
+        print("new connection from", self.ip)
 
     async def on_message(self, message):
         try:
@@ -1444,11 +1190,17 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                     chunk["chunkTotal"] = chunks
                     chunk["snapshotId"] = snapshot_id
                     chunk["timestamp"] = snapshot_time
-                    safe_write_message(self, json.dumps(chunk, ensure_ascii=False) + "\n")
+                    try:
+                        self.write_message(json.dumps(chunk, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
                 return
         payload = dict(obj)
         payload.setdefault("timestamp", time.time())
-        safe_write_message(self, json.dumps(payload, ensure_ascii=False) + "\n")
+        try:
+            self.write_message(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def send_error_msg(self, msg, code=None, **extra):
         payload = {"type": "error", "message": msg}
@@ -1457,7 +1209,7 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         payload.update(extra or {})
         self.send(payload)
 
-    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, experience_name="", subplace_name="", universe_id=None, root_place_id=None, place_id=None, job_id=None, executor_name="", executor_version="", device_type="", activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None, client_id_hash=None, install_id_hash=None, connection_id_hash=None):
+    def add_user(self, username, hidden, user_id=None, is_admin=False, game_status=None, experience_name="", subplace_name="", universe_id=None, root_place_id=None, place_id=None, job_id=None, executor_name="", executor_version="", device_type="", activity_hidden=False, display_name="", chat_color="78AAFF", chat_color2=None, hwid_hash=None):
         saved_profile = get_admin_profile(username, user_id) if is_admin else None
         appearance_username = None
         appearance_display_name = None
@@ -1516,9 +1268,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             "chat_color": normalize_chat_color(chat_color),
             "chat_color2": normalize_optional_chat_color(chat_color2),
             "hwid": hwid_hash,
-            "client_id": client_id_hash,
-            "install_id": install_id_hash,
-            "connection_id": connection_id_hash,
         }
 
     def remove_user(self):
@@ -1566,15 +1315,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         if chat_color2 == chat_color:
             chat_color2 = None
         hwid_hash = normalize_hwid(data.get("hwid"))
-        client_id_hash = normalize_device_identifier(data.get("analyticsClientId"), "analytics")
-        install_id_hash = normalize_device_identifier(data.get("installId"), "install")
-        connection_id_hash = connection_fingerprint(self)
-        current_device_bundle = _current_device_bundle(
-            hwid_hash,
-            client_id_hash,
-            install_id_hash,
-            connection_id_hash,
-        )
 
         if len(raw_game) > CONFIG["max_game_name_length"]:
             raw_game = raw_game[: CONFIG["max_game_name_length"]]
@@ -1645,28 +1385,15 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
                 pass
             return
 
-        device_state_changed = remember_device_signals(
-            username,
-            user_id=user_id,
-            hwid_hash=hwid_hash,
-            client_id_hash=client_id_hash,
-            install_id_hash=install_id_hash,
-            connection_id_hash=connection_id_hash,
-        )
-        linked_device_bundle = get_known_device_bundle(username, include_linked=True)
-
-        if _bundle_is_banned(current_device_bundle) or _bundle_is_banned(linked_device_bundle):
-            _ban_device_bundle(current_device_bundle)
-            _ban_device_bundle(linked_device_bundle)
-            schedule_state_save()
-            self.send_error_msg("This device is banned from NA Chat", code="hwid_banned")
+        if is_hwid_banned(hwid_hash):
+            self.send_error_msg("This device is HWID banned from NA Chat", code="hwid_banned")
             try:
-                self.close(4003, "Device banned from NA Chat")
+                self.close(4003, "HWID banned from NA Chat")
             except Exception:
                 pass
             return
 
-        if device_state_changed:
+        if hwid_hash and remember_hwid(username, hwid_hash, user_id):
             schedule_state_save()
 
         if username in connections and connections[username] is not self:
@@ -1682,8 +1409,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         is_admin = user_id in ADMIN_IDS
 
         self.username = username
-        log_source = _extract_connection_source(self) or getattr(self, "connection_source", None) or "unknown"
-        print(f"new connection from {username} {log_source}")
         self.add_user(
             username,
             hidden,
@@ -1704,9 +1429,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             chat_color=chat_color,
             chat_color2=chat_color2,
             hwid_hash=hwid_hash,
-            client_id_hash=client_id_hash,
-            install_id_hash=install_id_hash,
-            connection_id_hash=connection_id_hash,
         )
         schedule_presence()
 
@@ -2178,7 +1900,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             for member in recipients:
                 if member != self.username:
                     send_to_user(member, {"type": "group_removed", "groupId": group_id})
-            self.send({"type": "group_removed", "groupId": group_id})
             schedule_state_save()
             return
         group["members"].discard(self.username)
@@ -2277,7 +1998,10 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
-                safe_write_message(ws, msg)
+                try:
+                    ws.write_message(msg)
+                except Exception:
+                    pass
 
     def _send_targeted_by_user_id(self, payload, target):
         if target is None or target == "" or target == "all":
@@ -2295,8 +2019,11 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         for name, ws in list(connections.items()):
             uinfo = user_data.get(name, {})
             if uinfo.get("user_id") == target_id:
-                if safe_write_message(ws, msg):
+                try:
+                    ws.write_message(msg)
                     sent_any = True
+                except Exception:
+                    pass
         if not sent_any:
             self.send_error_msg("Target not online")
             return False
@@ -2535,26 +2262,26 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
             broadcast({"type": "system", "message": f"{target} was unmuted in NA Chat"})
 
         elif action == "hwid_ban":
-            bundle = get_known_device_bundle(resolved_target, include_linked=True)
-            if not _bundle_has_any(bundle):
-                self.send_error_msg("No device fingerprint is available for that user", code="hwid_unavailable")
+            digest = get_known_hwid(resolved_target)
+            if not digest:
+                self.send_error_msg("No HWID is available for that user; their executor may not expose gethwid()", code="hwid_unavailable")
                 return
-            _ban_device_bundle(bundle)
+            banned_hwids.add(digest)
             state_changed = True
             ws = connections.get(resolved_target)
             if ws:
                 try:
-                    ws.close(4003, "Device banned from NA Chat")
+                    ws.close(4003, "HWID banned from NA Chat")
                 except Exception:
                     pass
             broadcast({"type": "system", "message": f"{resolved_target} was HWID banned from NA Chat"})
 
         elif action == "unhwid_ban":
-            bundle = get_known_device_bundle(target, include_linked=True)
-            if not _bundle_has_any(bundle) or not _bundle_is_banned(bundle):
+            digest = get_known_hwid(target)
+            if not digest or digest not in banned_hwids:
                 self.send_error_msg("HWID ban not found", code="hwid_ban_not_found")
                 return
-            _unban_device_bundle(bundle)
+            banned_hwids.discard(digest)
             state_changed = True
             self.send({"type": "system", "message": f"HWID ban removed for {target}"})
 
@@ -2664,10 +2391,9 @@ async def dispatch_message(client, data):
 class HttpClient(IntegrationHandler):
     """A small adapter that gives HTTP polling clients the same interface as WebSockets."""
 
-    def __init__(self, client_id, connection_source, headers=None):
+    def __init__(self, client_id, ip):
         self.client_id = client_id
-        self.connection_source = connection_source
-        self.headers = dict(headers or {})
+        self.ip = ip
         self.username = None
         self.closed = False
         self.last_seen = time.time()
@@ -2688,19 +2414,6 @@ class HttpClient(IntegrationHandler):
         self.on_close()
 
 
-def drain_http_client_messages(client):
-    messages = []
-    while client.queue:
-        raw = client.queue.popleft()
-        try:
-            messages.append(json.loads(raw))
-        except Exception:
-            continue
-    if not client.queue:
-        client.queue_event.clear()
-    return messages
-
-
 def decode_request_body(request):
     try:
         raw = request.body.decode("utf-8") if request.body else "{}"
@@ -2716,16 +2429,12 @@ class AxxumRegisterHandler(tornado.web.RequestHandler):
     async def post(self):
         data = decode_request_body(self.request)
         client_id = uuid.uuid4().hex
-        client = HttpClient(client_id, self.request.remote_ip, self.request.headers)
+        client = HttpClient(client_id, self.request.remote_ip)
         http_clients[client_id] = client
         await dispatch_message(client, data)
         client.last_seen = time.time()
-
-        messages = drain_http_client_messages(client)
-
         self.set_header("Content-Type", "application/json")
-        self.set_header("Cache-Control", "no-store")
-        self.write({"clientId": client_id, "messages": messages})
+        self.write({"clientId": client_id})
 
 
 class AxxumPollHandler(tornado.web.RequestHandler):
@@ -2739,18 +2448,11 @@ class AxxumPollHandler(tornado.web.RequestHandler):
 
         client.last_seen = time.time()
 
-        wait_seconds = 20.0
-        try:
-            wait_seconds = float(self.get_query_argument("wait", default="20"))
-        except Exception:
-            wait_seconds = 20.0
-        wait_seconds = max(0.0, min(wait_seconds, 20.0))
-
-        if not client.queue and wait_seconds > 0:
+        if not client.queue:
             client.queue_event.clear()
             if not client.queue and not client.closed:
                 try:
-                    await asyncio.wait_for(client.queue_event.wait(), timeout=wait_seconds)
+                    await asyncio.wait_for(client.queue_event.wait(), timeout=20.0)
                 except asyncio.TimeoutError:
                     pass
 
@@ -2760,7 +2462,16 @@ class AxxumPollHandler(tornado.web.RequestHandler):
             return
 
         client.last_seen = time.time()
-        messages = drain_http_client_messages(client)
+        messages = []
+        while client.queue:
+            raw = client.queue.popleft()
+            try:
+                messages.append(json.loads(raw))
+            except Exception:
+                continue
+
+        if not client.queue:
+            client.queue_event.clear()
 
         if not messages:
             self.set_status(204)
@@ -2785,10 +2496,7 @@ class AxxumSendHandler(tornado.web.RequestHandler):
         data = decode_request_body(self.request)
         client.last_seen = time.time()
         await dispatch_message(client, data)
-        messages = drain_http_client_messages(client)
-        self.set_header("Content-Type", "application/json")
-        self.set_header("Cache-Control", "no-store")
-        self.write({"ok": True, "messages": messages})
+        self.write("OK")
 
 
 class AxxumDisconnectHandler(tornado.web.RequestHandler):

@@ -2699,8 +2699,20 @@ class AxxumRegisterHandler(tornado.web.RequestHandler):
         http_clients[client_id] = client
         await dispatch_message(client, data)
         client.last_seen = time.time()
+
+        messages = []
+        while client.queue:
+            raw = client.queue.popleft()
+            try:
+                messages.append(json.loads(raw))
+            except Exception:
+                continue
+        if not client.queue:
+            client.queue_event.clear()
+
         self.set_header("Content-Type", "application/json")
-        self.write({"clientId": client_id})
+        self.set_header("Cache-Control", "no-store")
+        self.write({"clientId": client_id, "messages": messages})
 
 
 class AxxumPollHandler(tornado.web.RequestHandler):
@@ -2714,11 +2726,18 @@ class AxxumPollHandler(tornado.web.RequestHandler):
 
         client.last_seen = time.time()
 
-        if not client.queue:
+        wait_seconds = 20.0
+        try:
+            wait_seconds = float(self.get_query_argument("wait", default="20"))
+        except Exception:
+            wait_seconds = 20.0
+        wait_seconds = max(0.0, min(wait_seconds, 20.0))
+
+        if not client.queue and wait_seconds > 0:
             client.queue_event.clear()
             if not client.queue and not client.closed:
                 try:
-                    await asyncio.wait_for(client.queue_event.wait(), timeout=20.0)
+                    await asyncio.wait_for(client.queue_event.wait(), timeout=wait_seconds)
                 except asyncio.TimeoutError:
                     pass
 

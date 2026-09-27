@@ -594,15 +594,12 @@ def character_appearance_user_id(value):
                 return user_id
     return None
 
-async def verify_registration_identity(user_id, hwid_hash, character_appearance_id, character_appearance):
-    appearance_id = coerce_user_id(character_appearance_id)
+async def verify_registration_identity(user_id, hwid_hash, character_appearance):
     appearance_url_user_id = character_appearance_user_id(character_appearance)
 
-    if not appearance_id or appearance_id <= 0:
-        return False, "Missing/invalid CharacterAppearanceId"
     if not appearance_url_user_id or appearance_url_user_id <= 0:
         return False, "Missing/invalid CharacterAppearance userId"
-    if int(user_id) != appearance_id or int(user_id) != appearance_url_user_id or appearance_id != appearance_url_user_id:
+    if int(user_id) != appearance_url_user_id:
         return False, "Roblox identity properties do not match"
 
     binding = get_hwid_identity_binding(hwid_hash)
@@ -1295,7 +1292,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
 
         hidden = bool(data.get("hidden", False))
         user_id = coerce_user_id(data.get("userId"))
-        character_appearance_id = data.get("characterAppearanceId")
         character_appearance = data.get("characterAppearance")
         activity_hidden = bool(data.get("activityHidden", False) or data.get("activity_hidden", False))
         raw_game = (data.get("game") or "").strip()
@@ -1363,7 +1359,6 @@ class IntegrationHandler(tornado.websocket.WebSocketHandler):
         identity_ok, identity_detail = await verify_registration_identity(
             user_id,
             hwid_hash,
-            character_appearance_id,
             character_appearance,
         )
         if not identity_ok:
